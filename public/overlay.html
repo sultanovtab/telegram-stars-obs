@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>starchik OBS overlay</title>
 <style>
-  :root { color-scheme: dark; --accent:#ffd84d; --glass:rgba(10,13,22,.82); --edge:rgba(255,255,255,.14); }
+  :root { color-scheme:dark; --accent:#ffd84d; --glass:rgba(10,13,22,.84); --edge:rgba(255,255,255,.14); }
   * { box-sizing:border-box; }
-  html,body { width:100%; height:100%; margin:0; overflow:hidden; background:transparent !important; font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif; }
+  html,body { width:100%; height:100%; margin:0; overflow:hidden; background:transparent!important; font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif; }
   #stage { position:fixed; inset:0; pointer-events:none; display:flex; justify-content:center; align-items:flex-start; padding-top:7vh; }
   body.vertical #stage { padding-top:10vh; }
   .alert { width:min(760px,80vw); display:grid; justify-items:center; gap:10px; opacity:0; transform:translateY(-34px) scale(.92); filter:blur(6px); }
@@ -22,171 +22,233 @@
   .fallback-star { font-size:118px; line-height:1; filter:drop-shadow(0 10px 20px rgba(255,205,42,.34)); animation:starPop 1.15s ease-in-out infinite alternate; }
   body.vertical .fallback-star { font-size:170px; }
   @keyframes starPop { from{transform:translateY(6px) rotate(-5deg) scale(.94)} to{transform:translateY(-7px) rotate(5deg) scale(1.06)} }
-  .card { width:100%; padding:20px 28px 22px; border:1px solid var(--edge); border-radius:26px; background:linear-gradient(135deg,rgba(15,18,30,.92),rgba(9,11,18,.82)); box-shadow:0 22px 60px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(16px); text-align:center; }
+  .card { width:100%; padding:20px 28px 22px; border:1px solid var(--edge); border-radius:26px; background:linear-gradient(135deg,rgba(15,18,30,.93),rgba(9,11,18,.84)); box-shadow:0 22px 60px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(16px); text-align:center; }
   body.vertical .card { padding:28px 34px 32px; border-radius:34px; }
   .eyebrow { font-weight:800; letter-spacing:.08em; text-transform:uppercase; font-size:14px; opacity:.72; }
   body.vertical .eyebrow { font-size:20px; }
   .headline { margin-top:6px; font-weight:900; font-size:34px; line-height:1.1; text-shadow:0 2px 18px rgba(0,0,0,.35); }
   body.vertical .headline { font-size:50px; }
   .amount { color:var(--accent); white-space:nowrap; }
-  .comment { margin-top:11px; font-size:22px; line-height:1.32; font-weight:650; overflow-wrap:anywhere; text-wrap:balance; }
+  .tts-badge { display:none; margin:11px auto 0; width:max-content; max-width:100%; padding:6px 12px; border-radius:999px; background:rgba(255,216,77,.14); border:1px solid rgba(255,216,77,.32); color:#ffe989; font-weight:800; font-size:14px; }
+  body.vertical .tts-badge { font-size:20px; padding:8px 16px; }
+  .tts-badge.on { display:block; }
+  .comment { margin-top:11px; font-size:22px; line-height:1.36; font-weight:650; overflow-wrap:anywhere; text-wrap:balance; }
   body.vertical .comment { margin-top:16px; font-size:31px; }
   .comment:empty { display:none; }
-  .status { position:fixed; left:16px; bottom:12px; padding:7px 10px; border-radius:10px; background:rgba(0,0,0,.35); font:12px/1.2 monospace; color:#fff; opacity:0; transition:opacity .2s; }
-  body.debug .status { opacity:.7; }
+  .status { position:fixed; left:16px; bottom:12px; padding:7px 10px; border-radius:10px; background:rgba(0,0,0,.42); font:12px/1.2 monospace; color:#fff; opacity:0; transition:opacity .2s; }
+  body.debug .status { opacity:.78; }
 </style>
 </head>
 <body>
 <div id="stage"></div><div class="status" id="status">connecting</div>
-<script>
-(() => {
-  const params = new URLSearchParams(location.search);
-  const key = params.get('key') || '';
-  const layout = location.pathname.includes('/vertical') ? 'vertical' : 'landscape';
-  document.body.classList.add(layout);
-  if (params.get('debug') === '1') document.body.classList.add('debug');
+<script type="module">
+import { estimateVisibleMs, ttsTimeoutMs } from '/overlay-logic.js';
 
-  const stage = document.getElementById('stage');
-  const status = document.getElementById('status');
-  const queue = [];
-  const known = new Set();
-  let playing = false;
-  let helloReceived = false;
-  let reconnectDelay = 800;
-  const storageKey = `starchik_last_seen_${layout}`;
-  let lastSeen = Number(localStorage.getItem(storageKey) || 0);
+const params = new URLSearchParams(location.search);
+const key = params.get('key') || '';
+const layout = location.pathname.includes('/vertical') ? 'vertical' : 'landscape';
+document.body.classList.add(layout);
+if (params.get('debug') === '1') document.body.classList.add('debug');
 
-  const setStatus = txt => status.textContent = txt;
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+const stage = document.getElementById('stage');
+const status = document.getElementById('status');
+const queue = [];
+const known = new Set();
+let playing = false;
+let helloReceived = false;
+let reconnectDelay = 800;
+let tierDurations = [6000,6500,7000,7500,8500,10000];
+const storageKey = `starchik_last_seen_${layout}`;
+let lastSeen = Number(localStorage.getItem(storageKey) || 0);
 
-  function remember(alert) {
-    if (!alert?.id) return false;
-    if (known.has(alert.id)) return false;
-    known.add(alert.id);
-    if (known.size > 300) known.delete(known.values().next().value);
-    return true;
+const setStatus = txt => status.textContent = txt;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clamp = (v,min,max) => Math.max(min,Math.min(max,v));
+
+function remember(alert) {
+  if (!alert?.id || known.has(alert.id)) return false;
+  known.add(alert.id);
+  if (known.size > 300) known.delete(known.values().next().value);
+  return true;
+}
+
+function enqueue(alert) {
+  if (!remember(alert)) return;
+  queue.push(alert);
+  if (alert.ts) {
+    lastSeen = Math.max(lastSeen, Number(alert.ts));
+    localStorage.setItem(storageKey, String(lastSeen));
   }
+  pump();
+}
 
-  function enqueue(alert) {
-    if (!remember(alert)) return;
-    queue.push(alert);
-    if (alert.ts) {
-      lastSeen = Math.max(lastSeen, alert.ts);
-      localStorage.setItem(storageKey, String(lastSeen));
+function tierFor(amount) {
+  if (amount >= 1000) return 5;
+  if (amount >= 500) return 4;
+  if (amount >= 250) return 3;
+  if (amount >= 100) return 2;
+  if (amount >= 25) return 1;
+  return 0;
+}
+
+async function pump() {
+  if (playing || !queue.length) return;
+  playing = true;
+  const alert = queue.shift();
+  try { await playAlert(alert); } catch (e) { console.error(e); setStatus(`alert error: ${e?.message || e}`); }
+  playing = false;
+  pump();
+}
+
+async function availableVoices() {
+  if (!('speechSynthesis' in window)) return [];
+  const direct = speechSynthesis.getVoices();
+  if (direct.length) return direct;
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(speechSynthesis.getVoices()), 1200);
+    const once = () => { clearTimeout(timer); speechSynthesis.removeEventListener('voiceschanged', once); resolve(speechSynthesis.getVoices()); };
+    speechSynthesis.addEventListener('voiceschanged', once);
+  });
+}
+
+async function speakComment(text, profile) {
+  const clean = String(text || '').trim();
+  if (!clean || !profile || !('speechSynthesis' in window) || !window.SpeechSynthesisUtterance) {
+    if (profile) setStatus('TTS unavailable; text kept visible');
+    return;
+  }
+  await sleep(650);
+  const voices = await availableVoices();
+  const utter = new SpeechSynthesisUtterance(clean);
+  utter.lang = profile.lang || 'ru-RU';
+  utter.rate = clamp(Number(profile.rate) || 1, .6, 1.5);
+  utter.pitch = clamp(Number(profile.pitch) || 1, .5, 1.6);
+  const requested = String(profile.voiceName || '').trim().toLowerCase();
+  const lang = utter.lang.toLowerCase().split('-')[0];
+  utter.voice = (requested && voices.find(v => v.name.toLowerCase() === requested)) || voices.find(v => (v.lang || '').toLowerCase().startsWith(lang)) || null;
+
+  return new Promise(resolve => {
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      try { speechSynthesis.cancel(); } catch {}
+      setStatus('TTS timeout fallback');
+      done();
+    }, ttsTimeoutMs(clean));
+    utter.onend = done;
+    utter.onerror = done;
+    try {
+      speechSynthesis.cancel();
+      speechSynthesis.speak(utter);
+      setStatus(`speaking: ${profile.label || 'TTS'}`);
+    } catch {
+      done();
     }
-    pump();
-  }
+  });
+}
 
-  function tierFor(amount) {
-    if (amount >= 1000) return 5;
-    if (amount >= 500) return 4;
-    if (amount >= 250) return 3;
-    if (amount >= 100) return 2;
-    if (amount >= 25) return 1;
-    return 0;
-  }
+async function playAlert(alert) {
+  const base = Number(alert.baseAmount ?? alert.amount ?? 0);
+  const total = Number(alert.totalAmount ?? alert.amount ?? base);
+  const tier = Number.isInteger(alert.tier) ? alert.tier : tierFor(base);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'alert';
 
-  async function pump() {
-    if (playing || !queue.length) return;
-    playing = true;
-    const alert = queue.shift();
-    try { await playAlert(alert); } catch (e) { console.error(e); }
-    playing = false;
-    pump();
-  }
+  const media = document.createElement('div');
+  media.className = 'media';
+  const mediaUrl = `/media/animation/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`;
+  let mediaWorked = false;
+  const img = document.createElement('img');
+  img.src = mediaUrl;
+  img.onload = () => { mediaWorked = true; };
+  img.onerror = () => {
+    if (mediaWorked) return;
+    img.remove();
+    const v = document.createElement('video');
+    v.src = mediaUrl; v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
+    v.onloadeddata = () => { mediaWorked = true; v.play().catch(()=>{}); };
+    v.onerror = () => {
+      v.remove();
+      const star = document.createElement('div'); star.className = 'fallback-star'; star.textContent = '⭐'; media.appendChild(star);
+    };
+    media.appendChild(v);
+  };
+  media.appendChild(img);
 
-  async function playAlert(alert) {
-    const tier = Number.isInteger(alert.tier) ? alert.tier : tierFor(alert.amount || 0);
-    const wrapper = document.createElement('div');
-    wrapper.className = 'alert';
+  const card = document.createElement('div'); card.className = 'card';
+  const eyebrow = document.createElement('div'); eyebrow.className = 'eyebrow'; eyebrow.textContent = alert.test ? 'TEST • starchik' : 'STARCHIK • TELEGRAM STARS';
+  const headline = document.createElement('div'); headline.className = 'headline';
+  const user = document.createElement('span'); user.textContent = alert.user || 'Кто-то';
+  const amount = document.createElement('span'); amount.className = 'amount'; amount.textContent = ` ${total} ⭐`;
+  headline.append(user, document.createTextNode(' отправил'), amount);
+  const ttsBadge = document.createElement('div');
+  ttsBadge.className = `tts-badge${alert.tts ? ' on' : ''}`;
+  if (alert.tts) ttsBadge.textContent = `🔊 ${alert.tts.label}${Number(alert.tts.price) ? ` +${alert.tts.price} ⭐` : ''}`;
+  const comment = document.createElement('div'); comment.className = 'comment'; comment.textContent = alert.comment || '';
+  card.append(eyebrow, headline, ttsBadge, comment);
+  wrapper.append(media, card);
+  stage.replaceChildren(wrapper);
 
-    const media = document.createElement('div');
-    media.className = 'media';
-    const mediaUrl = `/media/animation/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`;
+  const audio = new Audio(`/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`);
+  audio.volume = .9;
+  audio.play().catch(()=>{});
 
-    let mediaWorked = false;
-    const img = document.createElement('img');
-    img.src = mediaUrl;
-    img.onload = () => { mediaWorked = true; };
-    img.onerror = () => {
-      if (!mediaWorked) {
-        img.remove();
-        const v = document.createElement('video');
-        v.src = mediaUrl;
-        v.autoplay = true; v.muted = true; v.loop = true; v.playsInline = true;
-        v.onloadeddata = () => { mediaWorked = true; v.play().catch(()=>{}); };
-        v.onerror = () => {
-          v.remove();
-          const star = document.createElement('div');
-          star.className = 'fallback-star'; star.textContent = '⭐'; media.appendChild(star);
-        };
-        media.appendChild(v);
+  requestAnimationFrame(() => wrapper.classList.add('show'));
+  const tierMinimum = Number(tierDurations[tier] || 7000);
+  const visibleMs = estimateVisibleMs(alert.comment || '', tierMinimum);
+  const speech = alert.tts ? speakComment(alert.comment || '', alert.tts) : Promise.resolve();
+  await Promise.all([sleep(Math.max(1600, visibleMs - 500)), speech]);
+  wrapper.classList.remove('show'); wrapper.classList.add('hide');
+  await sleep(500);
+  wrapper.remove();
+  setStatus('online');
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws?key=${encodeURIComponent(key)}&layout=${layout}&mode=alerts`);
+  setStatus('connecting');
+  ws.onopen = () => { setStatus('online'); reconnectDelay = 800; };
+  ws.onmessage = ev => {
+    if (ev.data === 'pong') return;
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'hello') {
+      const recent = msg.data?.recent || [];
+      if (Array.isArray(msg.data?.tiers)) tierDurations = msg.data.tiers.map(x => Number(x.duration) || 7000);
+      if (!helloReceived && !lastSeen) {
+        for (const item of recent) remember(item);
+        const newest = recent.reduce((m,x)=>Math.max(m,Number(x.ts||0)),0);
+        if (newest) { lastSeen = newest; localStorage.setItem(storageKey,String(lastSeen)); }
+      } else {
+        recent.filter(x => Number(x.ts||0) > lastSeen).forEach(enqueue);
       }
-    };
-    media.appendChild(img);
+      helloReceived = true;
+    } else if (msg.type === 'alert') enqueue(msg.data);
+  };
+  ws.onclose = () => {
+    setStatus('reconnecting');
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(10000, Math.round(reconnectDelay * 1.6));
+  };
+  ws.onerror = () => ws.close();
+  const ping = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); else clearInterval(ping); }, 25000);
+}
 
-    const card = document.createElement('div');
-    card.className = 'card';
-    const eyebrow = document.createElement('div'); eyebrow.className = 'eyebrow'; eyebrow.textContent = alert.test ? 'TEST • starchik' : 'STARCHIK • TELEGRAM STARS';
-    const headline = document.createElement('div'); headline.className = 'headline';
-    const user = document.createElement('span'); user.textContent = alert.user || 'Кто-то';
-    const amount = document.createElement('span'); amount.className = 'amount'; amount.textContent = ` ${alert.amount || 0} ⭐`;
-    headline.append(user, document.createTextNode(' отправил'), amount);
-    const comment = document.createElement('div'); comment.className = 'comment'; comment.textContent = alert.comment || '';
-    card.append(eyebrow, headline, comment);
-    wrapper.append(media, card);
-    stage.replaceChildren(wrapper);
-
-    const audio = new Audio(`/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`);
-    audio.volume = 0.9;
-    audio.play().catch(()=>{});
-
-    requestAnimationFrame(() => wrapper.classList.add('show'));
-    const durations = [6000,6500,7000,7500,8500,10000];
-    const duration = durations[tier] || 7000;
-    await sleep(Math.max(1600, duration - 500));
-    wrapper.classList.remove('show'); wrapper.classList.add('hide');
-    await sleep(500);
-    wrapper.remove();
-  }
-
-  function connect() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/ws?key=${encodeURIComponent(key)}&layout=${layout}`);
-    setStatus('connecting');
-
-    ws.onopen = () => { setStatus('online'); reconnectDelay = 800; };
-    ws.onmessage = ev => {
-      if (ev.data === 'pong') return;
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'hello') {
-        const recent = msg.data?.recent || [];
-        if (!helloReceived && !lastSeen) {
-          // First ever load: do not replay old donations from before the stream started.
-          for (const item of recent) remember(item);
-          const newest = recent.reduce((m,x)=>Math.max(m,Number(x.ts||0)),0);
-          if (newest) { lastSeen = newest; localStorage.setItem(storageKey,String(lastSeen)); }
-        } else {
-          // Reconnect/reload: recover alerts that arrived while OBS was disconnected.
-          recent.filter(x => Number(x.ts||0) > lastSeen).forEach(enqueue);
-        }
-        helloReceived = true;
-      } else if (msg.type === 'alert') enqueue(msg.data);
-    };
-    ws.onclose = () => {
-      setStatus('reconnecting');
-      setTimeout(connect, reconnectDelay);
-      reconnectDelay = Math.min(10000, Math.round(reconnectDelay * 1.6));
-    };
-    ws.onerror = () => ws.close();
-    const ping = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); else clearInterval(ping); }, 25000);
-  }
-
-  if (params.get('preview') === '1') {
-    setStatus('preview');
-    setTimeout(() => enqueue({ id:'preview-'+Date.now(), ts:Date.now(), user:'@starchik_demo', amount:250, comment:'Спасибо за поддержку! Это предпросмотр OBS-алерта ✨', tier:3, test:true }), 250);
-  } else if (!key) setStatus('missing key'); else connect();
-})();
+if (params.get('preview') === '1') {
+  setStatus('preview');
+  const withTts = params.get('tts') === '1';
+  setTimeout(() => enqueue({
+    id:'preview-'+Date.now(), ts:Date.now(), user:'@starchik_demo', amount:260, baseAmount:250, totalAmount:260,
+    comment:'Спасибо за поддержку! Это длинный предпросмотр: сообщение останется на экране достаточно долго, чтобы его успели прочитать.',
+    tts:withTts ? {id:'standard',label:'Стандартная',price:10,lang:'ru-RU',rate:1,pitch:1,voiceName:''} : null,
+    tier:3, test:true
+  }),250);
+} else if (!key) setStatus('missing key'); else connect();
 </script>
 </body>
 </html>

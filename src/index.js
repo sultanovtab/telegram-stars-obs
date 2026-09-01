@@ -1,5 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
-import { overlayAssetUrl } from "./overlay-route.js";
+import { overlayAssetUrl, goalAssetUrl } from "./overlay-route.js";
+import {
+  DEFAULT_TTS_PROFILES,
+  normalizeConfigV4,
+  enabledTtsProfiles,
+  buildOrderPricing,
+  buildStarInvoicePrices,
+  findTierIndex,
+  goalProgress
+} from "./v4-logic.js";
 
 const DEFAULT_AMOUNTS = [10, 25, 50, 100, 250, 500, 1000];
 const MAX_COMMENT = 140;
@@ -113,6 +122,7 @@ function termsText(brand) {
     "Stars используются для покупки цифровой услуги: показа сообщения/алерта на стриме.",
     "",
     "• Алерт запускается только после подтверждённого Telegram successful_payment.",
+    "• Если выбрана озвучка, её стоимость добавляется к основной сумме до открытия Telegram invoice.",
     "• Сообщения могут не отображаться или быть скрыты, если нарушают правила платформы/стрима.",
     "• При техническом сбое напишите /paysupport — мы проверим платёж по Telegram charge ID.",
     "• Оплату обрабатывает Telegram. По спорным платежам обращайтесь владельцу бота через /paysupport.",
@@ -125,9 +135,41 @@ function adminMenu() {
   return {
     inline_keyboard: [
       [callbackButton("🎬 Анимации", "adm:animations"), callbackButton("🔊 Звуки", "adm:sounds")],
-      [callbackButton("⭐ Суммы", "adm:amounts"), callbackButton("🧪 Тест алерта", "adm:test")],
-      [callbackButton("🔗 OBS-ссылки", "adm:links"), callbackButton("📋 Последние платежи", "adm:history")],
-      [callbackButton("🔐 Новый OBS-ключ", "adm:rotate")]
+      [callbackButton("🗣 Озвучка", "adm:tts"), callbackButton("⭐ Суммы", "adm:amounts")],
+      [callbackButton("🎯 Цель сбора", "adm:goal"), callbackButton("💰 Баланс", "adm:balance")],
+      [callbackButton("🧪 Тест алерта", "adm:test"), callbackButton("🔗 OBS-ссылки", "adm:links")],
+      [callbackButton("📋 Последние платежи", "adm:history"), callbackButton("🔐 Новый OBS-ключ", "adm:rotate")]
+    ]
+  };
+}
+
+function ttsAdminKeyboard(profiles) {
+  return {
+    inline_keyboard: [
+      ...profiles.map((p, i) => [callbackButton(`${p.enabled ? "✅" : "⛔"} ${p.label} • +${p.price} ⭐`, `adm:ttsprofile:${i}`)]),
+      [callbackButton("⬅️ Админка", "adm:home")]
+    ]
+  };
+}
+
+function ttsProfileKeyboard(profile, index) {
+  return {
+    inline_keyboard: [
+      [callbackButton(profile.enabled ? "⛔ Выключить" : "✅ Включить", `adm:ttstoggle:${index}`)],
+      [callbackButton("💰 Изменить цену", `adm:ttsprice:${index}`), callbackButton("✏️ Переименовать", `adm:ttsname:${index}`)],
+      [callbackButton("🧪 Тест озвучки", `adm:ttstest:${index}`)],
+      [callbackButton("⬅️ Озвучка", "adm:tts")]
+    ]
+  };
+}
+
+function goalAdminKeyboard(goal) {
+  return {
+    inline_keyboard: [
+      [callbackButton(goal.enabled ? "⛔ Скрыть виджет" : "✅ Показать виджет", "adm:goaltoggle")],
+      [callbackButton("✏️ Название", "adm:goaltitle"), callbackButton("🎯 Сумма цели", "adm:goaltarget")],
+      [callbackButton("♻️ Обновить баланс", "adm:goalrefresh"), callbackButton("🔗 OBS-ссылки цели", "adm:goallinks")],
+      [callbackButton("⬅️ Админка", "adm:home")]
     ]
   };
 }
@@ -243,7 +285,7 @@ export default {
       return hub.fetch(forwarded);
     }
 
-    if (url.pathname === "/ws" || url.pathname.startsWith("/media/") || url.pathname === "/status") {
+    if (url.pathname === "/ws" || url.pathname.startsWith("/media/") || url.pathname === "/status" || url.pathname === "/goal-state") {
       const headers = new Headers(request.headers);
       headers.set("x-worker-origin", origin);
       return hub.fetch(new Request(`https://hub.internal${url.pathname}${url.search}`, {
@@ -255,6 +297,12 @@ export default {
 
     if (url.pathname === "/overlay/landscape" || url.pathname === "/overlay/vertical") {
       const assetUrl = overlayAssetUrl(request.url);
+      const assetRequest = new Request(assetUrl, request);
+      return env.ASSETS.fetch(assetRequest);
+    }
+
+    if (url.pathname === "/goal/landscape" || url.pathname === "/goal/vertical") {
+      const assetUrl = goalAssetUrl(request.url);
       const assetRequest = new Request(assetUrl, request);
       return env.ASSETS.fetch(assetRequest);
     }
@@ -277,11 +325,15 @@ export class StreamHub extends DurableObject {
         overlayKey: randomToken(24),
         amounts: DEFAULT_AMOUNTS,
         tiers: structuredClone(DEFAULT_TIERS),
+        ttsProfiles: structuredClone(DEFAULT_TTS_PROFILES),
+        goal: { enabled: false, title: "Цель сбора", target: 1000 },
         origin: null
       };
-      await this.ctx.storage.put("config", cfg);
     }
-    return cfg;
+    const normalized = normalizeConfigV4(cfg);
+    if (JSON.stringify(normalized) !== JSON.stringify(cfg)) await this.ctx.storage.put("config", normalized);
+    else if (!(await this.ctx.storage.get("config"))) await this.ctx.storage.put("config", normalized);
+    return normalized;
   }
 
   async saveConfig(cfg) {
@@ -299,6 +351,7 @@ export class StreamHub extends DurableObject {
     if (url.pathname === "/ws") return this.handleWebSocket(request);
     if (url.pathname.startsWith("/media/")) return this.handleMedia(request);
     if (url.pathname === "/status") return this.handleStatus(request);
+    if (url.pathname === "/goal-state") return this.handleGoalState(request);
     return new Response("Not Found", { status: 404 });
   }
 
@@ -306,7 +359,67 @@ export class StreamHub extends DurableObject {
     const cfg = await this.config();
     const key = new URL(request.url).searchParams.get("key");
     if (key !== cfg.overlayKey) return json({ ok: false }, 403);
-    return json({ ok: true, brand: this.env.BRAND_NAME, tiers: cfg.tiers.map(t => ({ label: t.label, duration: t.duration, hasAnimation: !!t.animation, hasSound: !!t.sound })) });
+    return json({
+      ok: true,
+      brand: this.env.BRAND_NAME,
+      tiers: cfg.tiers.map(t => ({ label: t.label, duration: t.duration, hasAnimation: !!t.animation, hasSound: !!t.sound })),
+      ttsProfiles: cfg.ttsProfiles.map(p => ({ id: p.id, label: p.label, price: p.price, enabled: p.enabled })),
+      goal: cfg.goal
+    });
+  }
+
+  async getStarBalance(force = false) {
+    const cached = await this.ctx.storage.get("starBalance");
+    if (!force && cached && Date.now() - Number(cached.fetchedAt || 0) < 30000) return cached;
+    try {
+      const raw = await tg(this.env, "getMyStarBalance", {});
+      const balance = {
+        amount: Number(raw?.amount || 0),
+        nanostarAmount: Number(raw?.nanostar_amount || 0),
+        fetchedAt: Date.now()
+      };
+      await this.ctx.storage.put("starBalance", balance);
+      return balance;
+    } catch (error) {
+      if (cached) return { ...cached, stale: true, error: String(error?.message || error) };
+      throw error;
+    }
+  }
+
+  async getGoalState(force = false) {
+    const cfg = await this.config();
+    const balance = await this.getStarBalance(force);
+    const progress = goalProgress(balance.amount, cfg.goal.target);
+    return {
+      enabled: !!cfg.goal.enabled,
+      title: cfg.goal.title,
+      current: progress.current,
+      target: progress.target,
+      percent: progress.percent,
+      nanostarAmount: balance.nanostarAmount || 0,
+      updatedAt: balance.fetchedAt || Date.now(),
+      stale: !!balance.stale
+    };
+  }
+
+  async handleGoalState(request) {
+    const url = new URL(request.url);
+    const cfg = await this.config();
+    if (url.searchParams.get("key") !== cfg.overlayKey) return json({ ok: false }, 403);
+    try {
+      return json({ ok: true, goal: await this.getGoalState(url.searchParams.get("refresh") === "1") });
+    } catch (error) {
+      return json({ ok: false, error: String(error?.message || error) }, 502);
+    }
+  }
+
+  async broadcastGoal(force = false) {
+    let goal;
+    try { goal = await this.getGoalState(force); } catch { return; }
+    const message = JSON.stringify({ type: "goal", data: goal });
+    for (const ws of this.ctx.getWebSockets()) {
+      try { ws.send(message); } catch {}
+    }
   }
 
   async handleWebSocket(request) {
@@ -318,19 +431,22 @@ export class StreamHub extends DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     const layout = url.searchParams.get("layout") === "vertical" ? "vertical" : "landscape";
+    const mode = url.searchParams.get("mode") === "goal" ? "goal" : "alerts";
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ layout });
+    server.serializeAttachment({ layout, mode });
 
     const history = (await this.ctx.storage.get("history")) || [];
-    server.send(JSON.stringify({
-      type: "hello",
-      data: {
-        brand: this.env.BRAND_NAME,
-        layout,
-        recent: history.slice(-20),
-        tiers: cfg.tiers.map((t, i) => ({ index: i, label: t.label, duration: t.duration, hasAnimation: !!t.animation, hasSound: !!t.sound }))
-      }
-    }));
+    const helloData = {
+      brand: this.env.BRAND_NAME,
+      layout,
+      mode,
+      recent: mode === "alerts" ? history.slice(-20) : [],
+      tiers: cfg.tiers.map((t, i) => ({ index: i, label: t.label, duration: t.duration, hasAnimation: !!t.animation, hasSound: !!t.sound }))
+    };
+    if (mode === "goal") {
+      try { helloData.goal = await this.getGoalState(false); } catch {}
+    }
+    server.send(JSON.stringify({ type: "hello", data: helloData }));
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -477,6 +593,66 @@ export class StreamHub extends DurableObject {
         return;
       }
 
+      if (adminAction.type === "ttsprice") {
+        const value = Math.trunc(Number(text.replace(/[^0-9]/g, "")));
+        if (!Number.isFinite(value) || value < 0 || value > 5000) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Введи цену озвучки от 0 до 5000 ⭐." });
+          return;
+        }
+        const cfg = await this.config();
+        if (!cfg.ttsProfiles[adminAction.profile]) return;
+        cfg.ttsProfiles[adminAction.profile].price = value;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Цена сохранена: +${value} ⭐`, reply_markup: ttsProfileKeyboard(cfg.ttsProfiles[adminAction.profile], adminAction.profile) });
+        return;
+      }
+
+      if (adminAction.type === "ttsname") {
+        const value = text.trim().slice(0, 32);
+        if (value.length < 2) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Название должно быть хотя бы из 2 символов." });
+          return;
+        }
+        const cfg = await this.config();
+        if (!cfg.ttsProfiles[adminAction.profile]) return;
+        cfg.ttsProfiles[adminAction.profile].label = value;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Название сохранено: ${value}`, reply_markup: ttsProfileKeyboard(cfg.ttsProfiles[adminAction.profile], adminAction.profile) });
+        return;
+      }
+
+      if (adminAction.type === "goaltitle") {
+        const value = text.trim().slice(0, 80);
+        if (value.length < 2) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Название цели должно быть хотя бы из 2 символов." });
+          return;
+        }
+        const cfg = await this.config();
+        cfg.goal.title = value;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await this.broadcastGoal(false);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Новая цель: ${value}`, reply_markup: goalAdminKeyboard(cfg.goal) });
+        return;
+      }
+
+      if (adminAction.type === "goaltarget") {
+        const value = Math.trunc(Number(text.replace(/[^0-9]/g, "")));
+        if (!Number.isFinite(value) || value < 1 || value > 1000000000) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Введи цель целым числом от 1 до 1 000 000 000 ⭐." });
+          return;
+        }
+        const cfg = await this.config();
+        cfg.goal.target = value;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await this.broadcastGoal(false);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Сумма цели: ${value} ⭐`, reply_markup: goalAdminKeyboard(cfg.goal) });
+        return;
+      }
+
       if (["animation", "sound"].includes(adminAction.type)) {
         const media = mediaFromMessage(message, adminAction.type);
         if (media?.error) {
@@ -531,8 +707,7 @@ export class StreamHub extends DurableObject {
 
     if (pending.stage === "comment") {
       const comment = text.slice(0, MAX_COMMENT);
-      await this.createInvoice(user, pending.amount, comment);
-      await this.ctx.storage.delete(`pending:${userId}`);
+      await this.offerTtsOrInvoice(user, pending.amount, comment);
       return;
     }
   }
@@ -589,9 +764,29 @@ export class StreamHub extends DurableObject {
     if (data === "comment:skip") {
       const pending = await this.ctx.storage.get(`pending:${userId}`);
       if (pending?.stage === "comment") {
-        await this.createInvoice(user, pending.amount, "");
+        await this.createInvoice(user, pending.amount, "", null);
         await this.ctx.storage.delete(`pending:${userId}`);
       }
+      return;
+    }
+
+    if (data === "tts:none" || data.startsWith("tts:")) {
+      const pending = await this.ctx.storage.get(`pending:${userId}`);
+      if (pending?.stage !== "tts") return;
+      if (data === "tts:none") {
+        await this.createInvoice(user, pending.baseAmount, pending.comment, null);
+      } else {
+        const id = data.slice(4);
+        const cfg = await this.config();
+        const profile = cfg.ttsProfiles.find(p => p.id === id && p.enabled);
+        if (!profile) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "⚠️ Эта озвучка сейчас недоступна. Выбери другой вариант." });
+          await this.offerTtsOrInvoice(user, pending.baseAmount, pending.comment);
+          return;
+        }
+        await this.createInvoice(user, pending.baseAmount, pending.comment, profile);
+      }
+      await this.ctx.storage.delete(`pending:${userId}`);
       return;
     }
 
@@ -624,7 +819,10 @@ export class StreamHub extends DurableObject {
       const current = cfg.tiers[tier][action];
       await tg(this.env, "sendMessage", {
         chat_id: userId,
-        text: `${action === "animation" ? "🎬" : "🔊"} ${cfg.tiers[tier].label}\n${current ? `Сейчас: ${current.name || current.mime}` : "Сейчас ничего не назначено."}\n\n${action === "animation" ? "Отправь GIF, WebM/MP4, картинку или обычный/видео-стикер." : "Отправь аудиофайл или voice."}`,
+        text: `${action === "animation" ? "🎬" : "🔊"} ${cfg.tiers[tier].label}
+${current ? `Сейчас: ${current.name || current.mime}` : "Сейчас ничего не назначено."}
+
+${action === "animation" ? "Отправь GIF, WebM/MP4, картинку или обычный/видео-стикер." : "Отправь аудиофайл или voice."}`,
         reply_markup: { inline_keyboard: [[callbackButton("🗑 Удалить", `adm:clear:${action}:${tier}`)], [callbackButton("⬅️ Назад", action === "animation" ? "adm:animations" : "adm:sounds")]] }
       });
     } else if (action === "clear") {
@@ -635,21 +833,122 @@ export class StreamHub extends DurableObject {
       await this.saveConfig(cfg);
       await this.ctx.storage.delete(`adminAction:${userId}`);
       await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Удалено для ${cfg.tiers[tier].label}.`, reply_markup: adminMenu() });
+    } else if (action === "tts") {
+      const lines = cfg.ttsProfiles.map((p, i) => `${i + 1}. ${p.enabled ? "✅" : "⛔"} ${p.label} — +${p.price} ⭐`).join("\n");
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `🗣 Озвучка
+
+${lines}
+
+Зрители видят только включённые варианты. Стандартная работает через системный голос OBS; остальные слоты можно держать выключенными до подключения отдельных голосов.`, reply_markup: ttsAdminKeyboard(cfg.ttsProfiles) });
+    } else if (action === "ttsprofile") {
+      const index = Number(parts[2]);
+      const profile = cfg.ttsProfiles[index];
+      if (!profile) return;
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `🗣 ${profile.label}
+Статус: ${profile.enabled ? "включена" : "выключена"}
+Доплата: +${profile.price} ⭐
+Язык: ${profile.lang || "ru-RU"}`, reply_markup: ttsProfileKeyboard(profile, index) });
+    } else if (action === "ttstoggle") {
+      const index = Number(parts[2]);
+      if (!cfg.ttsProfiles[index]) return;
+      cfg.ttsProfiles[index].enabled = !cfg.ttsProfiles[index].enabled;
+      await this.saveConfig(cfg);
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `${cfg.ttsProfiles[index].enabled ? "✅ Включено" : "⛔ Выключено"}: ${cfg.ttsProfiles[index].label}`, reply_markup: ttsProfileKeyboard(cfg.ttsProfiles[index], index) });
+    } else if (action === "ttsprice") {
+      const index = Number(parts[2]);
+      if (!cfg.ttsProfiles[index]) return;
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "ttsprice", profile: index });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `💰 Сейчас ${cfg.ttsProfiles[index].label}: +${cfg.ttsProfiles[index].price} ⭐
+Отправь новую доплату числом.` });
+    } else if (action === "ttsname") {
+      const index = Number(parts[2]);
+      if (!cfg.ttsProfiles[index]) return;
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "ttsname", profile: index });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `✏️ Отправь новое название для «${cfg.ttsProfiles[index].label}».` });
+    } else if (action === "ttstest") {
+      const index = Number(parts[2]);
+      const profile = cfg.ttsProfiles[index];
+      if (!profile) return;
+      const pricing = buildOrderPricing(100, { ...profile, enabled: true });
+      await this.emitAlert({
+        id: `tts-test-${crypto.randomUUID()}`,
+        ts: Date.now(),
+        user: "@starchik_test",
+        amount: pricing.totalAmount,
+        baseAmount: pricing.baseAmount,
+        totalAmount: pricing.totalAmount,
+        comment: `Проверка озвучки «${profile.label}». Если ты это слышишь — всё работает.`,
+        tts: pricing.tts,
+        tier: findTierIndex(pricing.baseAmount, cfg.tiers),
+        test: true
+      }, false);
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Тест озвучки «${profile.label}» отправлен в OBS.` });
     } else if (action === "amounts") {
       await this.ctx.storage.put(`adminAction:${userId}`, { type: "amounts" });
-      await tg(this.env, "sendMessage", { chat_id: userId, text: `⭐ Сейчас: ${cfg.amounts.join(" / ")}\n\nОтправь новые суммы одним сообщением, например:\n10, 25, 50, 100, 250, 500, 1000` });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `⭐ Сейчас: ${cfg.amounts.join(" / ")}
+
+Отправь новые суммы одним сообщением, например:
+10, 25, 50, 100, 250, 500, 1000` });
+    } else if (action === "goal") {
+      let state;
+      try { state = await this.getGoalState(false); } catch { state = { current: 0, percent: 0, target: cfg.goal.target }; }
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `🎯 Цель сбора
+
+${cfg.goal.enabled ? "✅ Виджет включён" : "⛔ Виджет скрыт"}
+Название: ${cfg.goal.title}
+Баланс: ${state.current} ⭐
+Цель: ${cfg.goal.target} ⭐
+Прогресс: ${state.percent}%`, reply_markup: goalAdminKeyboard(cfg.goal) });
+    } else if (action === "goaltoggle") {
+      cfg.goal.enabled = !cfg.goal.enabled;
+      await this.saveConfig(cfg);
+      await this.broadcastGoal(false);
+      await tg(this.env, "sendMessage", { chat_id: userId, text: cfg.goal.enabled ? "✅ Виджет цели включён." : "⛔ Виджет цели скрыт.", reply_markup: goalAdminKeyboard(cfg.goal) });
+    } else if (action === "goaltitle") {
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "goaltitle" });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `✏️ Сейчас: ${cfg.goal.title}
+Отправь новое название цели, например: «На новое кресло».` });
+    } else if (action === "goaltarget") {
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "goaltarget" });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `🎯 Сейчас цель: ${cfg.goal.target} ⭐
+Отправь новое количество Stars числом.` });
+    } else if (action === "goalrefresh") {
+      try {
+        const state = await this.getGoalState(true);
+        await this.broadcastGoal(false);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `♻️ Баланс обновлён: ${state.current} ⭐ • ${state.percent}% от ${state.target} ⭐`, reply_markup: goalAdminKeyboard(cfg.goal) });
+      } catch (error) {
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `⚠️ Не удалось получить баланс: ${String(error?.message || error)}` });
+      }
+    } else if (action === "goallinks") {
+      await this.sendGoalLinks(userId, cfg);
+    } else if (action === "balance") {
+      try {
+        const balance = await this.getStarBalance(true);
+        const progress = goalProgress(balance.amount, cfg.goal.target);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `💰 Баланс @${this.env.BOT_USERNAME}
+
+Доступно: ${balance.amount} ⭐
+Текущая цель: ${cfg.goal.title}
+${progress.current} / ${progress.target} ⭐ • ${progress.percent}%` });
+        await this.broadcastGoal(false);
+      } catch (error) {
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `⚠️ Telegram не отдал баланс: ${String(error?.message || error)}` });
+      }
     } else if (action === "test") {
       await tg(this.env, "sendMessage", { chat_id: userId, text: "🧪 Какой алерт проверить?", reply_markup: tierKeyboard("adm:testtier", cfg.tiers) });
     } else if (action === "testtier") {
       const tier = Number(parts[2]);
       if (!cfg.tiers[tier]) return;
-      const amount = cfg.tiers[tier].min === 1 ? 10 : cfg.tiers[tier].min;
+      const baseAmount = cfg.tiers[tier].min === 1 ? 10 : cfg.tiers[tier].min;
       await this.emitAlert({
         id: `test-${crypto.randomUUID()}`,
         ts: Date.now(),
         user: "@starchik_test",
-        amount,
-        comment: "Это тестовый алерт — Stars не списывались ✨",
+        amount: baseAmount,
+        baseAmount,
+        totalAmount: baseAmount,
+        comment: "Это тестовый алерт. Теперь длинный текст остаётся на экране дольше, чтобы его можно было прочитать ✨",
         tier,
         test: true
       }, false);
@@ -659,8 +958,11 @@ export class StreamHub extends DurableObject {
     } else if (action === "history") {
       const history = (await this.ctx.storage.get("history")) || [];
       const paid = history.filter(x => !x.test).slice(-10).reverse();
-      const body = paid.length ? paid.map((x, i) => `${i + 1}. ${x.user} — ${x.amount} ⭐${x.comment ? `\n   “${x.comment}”` : ""}`).join("\n\n") : "Платежей пока нет.";
-      await tg(this.env, "sendMessage", { chat_id: userId, text: `📋 Последние платежи\n\n${body}` });
+      const body = paid.length ? paid.map((x, i) => `${i + 1}. ${x.user} — ${x.totalAmount ?? x.amount} ⭐${x.tts ? ` • 🔊 ${x.tts.label}` : ""}${x.comment ? `
+   “${x.comment}”` : ""}`).join("\n\n") : "Платежей пока нет.";
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `📋 Последние платежи
+
+${body}` });
     } else if (action === "rotate") {
       cfg.overlayKey = randomToken(24);
       await this.saveConfig(cfg);
@@ -669,6 +971,7 @@ export class StreamHub extends DurableObject {
       }
       await tg(this.env, "sendMessage", { chat_id: userId, text: "🔐 OBS-ключ заменён. Старые ссылки больше не работают." });
       await this.sendObsLinks(userId, cfg);
+      await this.sendGoalLinks(userId, cfg);
     }
   }
 
@@ -692,33 +995,60 @@ export class StreamHub extends DurableObject {
     });
   }
 
-  async createInvoice(user, amount, comment) {
+  async offerTtsOrInvoice(user, baseAmount, comment) {
+    const cfg = await this.config();
+    const profiles = enabledTtsProfiles(cfg.ttsProfiles);
+    const cleanComment = String(comment || "").slice(0, MAX_COMMENT);
+    if (!cleanComment || !profiles.length) {
+      await this.createInvoice(user, baseAmount, cleanComment, null);
+      await this.ctx.storage.delete(`pending:${user.id}`);
+      return;
+    }
+    await this.ctx.storage.put(`pending:${user.id}`, { stage: "tts", baseAmount, comment: cleanComment });
+    const rows = profiles.map(p => [callbackButton(`🔊 ${p.label} +${p.price} ⭐`, `tts:${p.id}`)]);
+    rows.push([callbackButton("Без озвучки", "tts:none")], [callbackButton("❌ Отмена", "cancel")]);
+    await tg(this.env, "sendMessage", {
+      chat_id: user.id,
+      text: `🗣 Озвучить сообщение на стриме?
+Основная поддержка: ${baseAmount} ⭐
+Озвучка добавляется к сумме до оплаты.`,
+      reply_markup: { inline_keyboard: rows }
+    });
+  }
+
+  async createInvoice(user, baseAmount, comment, ttsProfile = null) {
+    const pricing = buildOrderPricing(baseAmount, ttsProfile);
     const payload = `st_${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const order = {
       payload,
       userId: user.id,
       user: formatUser(user),
-      amount,
+      amount: pricing.totalAmount,
+      baseAmount: pricing.baseAmount,
+      totalAmount: pricing.totalAmount,
+      ttsFee: pricing.ttsFee,
+      tts: pricing.tts,
       comment: String(comment || "").slice(0, MAX_COMMENT),
       createdAt: Date.now(),
       status: "invoice_sent"
     };
     await this.ctx.storage.put(`order:${payload}`, order);
 
+    const prices = buildStarInvoicePrices(pricing);
     await tg(this.env, "sendInvoice", {
       chat_id: user.id,
       title: `Поддержка ${this.env.BRAND_NAME}`.slice(0, 32),
-      description: "Показ Stars-алерта и сообщения на стриме".slice(0, 255),
+      description: pricing.tts ? `Алерт + озвучка «${pricing.tts.label}»` : "Показ Stars-алерта и сообщения на стриме",
       payload,
       currency: "XTR",
-      prices: [{ label: "Stars", amount }]
+      prices
     });
   }
 
   async handlePreCheckout(query) {
     const payload = query.invoice_payload;
     const order = await this.ctx.storage.get(`order:${payload}`);
-    const valid = !!order && order.status !== "paid" && query.currency === "XTR" && Number(query.total_amount) === Number(order.amount) && Number(query.from?.id) === Number(order.userId);
+    const valid = !!order && order.status !== "paid" && query.currency === "XTR" && Number(query.total_amount) === Number(order.totalAmount ?? order.amount) && Number(query.from?.id) === Number(order.userId);
     await tg(this.env, "answerPreCheckoutQuery", valid
       ? { pre_checkout_query_id: query.id, ok: true }
       : { pre_checkout_query_id: query.id, ok: false, error_message: "Не удалось проверить заказ. Вернись в бот и создай новый платёж." }
@@ -730,7 +1060,9 @@ export class StreamHub extends DurableObject {
     const payload = payment.invoice_payload;
     const order = await this.ctx.storage.get(`order:${payload}`);
     if (!order) return;
-    if (payment.currency !== "XTR" || Number(payment.total_amount) !== Number(order.amount)) return;
+    const totalAmount = Number(order.totalAmount ?? order.amount);
+    const baseAmount = Number(order.baseAmount ?? order.amount);
+    if (payment.currency !== "XTR" || Number(payment.total_amount) !== totalAmount) return;
 
     const chargeId = payment.telegram_payment_charge_id;
     const knownCharges = (await this.ctx.storage.get("charges")) || [];
@@ -745,21 +1077,30 @@ export class StreamHub extends DurableObject {
     await this.ctx.storage.put(`order:${payload}`, order);
 
     const cfg = await this.config();
-    const tier = Math.max(0, cfg.tiers.findIndex(t => order.amount >= t.min && order.amount <= t.max));
+    const tier = findTierIndex(baseAmount, cfg.tiers);
     const alert = {
       id: chargeId,
       ts: Date.now(),
       user: order.user,
-      amount: order.amount,
+      amount: totalAmount,
+      baseAmount,
+      totalAmount,
       comment: order.comment,
+      tts: order.tts || null,
       tier,
       test: false
     };
     await this.emitAlert(alert, true);
+    await this.broadcastGoal(true);
 
+    const detail = order.tts ? `
+🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
     await tg(this.env, "sendMessage", {
       chat_id: message.chat.id,
-      text: `💛 Спасибо! ${order.amount} ⭐ получены. Алерт отправлен на стрим.${order.comment ? `\n\nТвой комментарий: “${order.comment}”` : ""}`,
+      text: `💛 Спасибо! ${totalAmount} ⭐ получены.${detail}
+Алерт отправлен на стрим.${order.comment ? `
+
+Твой комментарий: “${order.comment}”` : ""}`,
       reply_markup: mainMenu(cfg.amounts)
     });
   }
@@ -787,8 +1128,40 @@ export class StreamHub extends DurableObject {
     const vertical = `${origin}/overlay/vertical?key=${cfg.overlayKey}`;
     await tg(this.env, "sendMessage", {
       chat_id: userId,
-      text: `🔗 OBS Browser Source\n\n🖥 1920×1080:\n${landscape}\n\n📱 1080×1920:\n${vertical}\n\n⚠️ Не публикуй эти ссылки. Если утекут — нажми «Новый OBS-ключ».`,
+      text: `🔗 OBS Browser Source — алерты
+
+🖥 1920×1080:
+${landscape}
+
+📱 1080×1920:
+${vertical}
+
+⚠️ Не публикуй эти ссылки. Если утекут — нажми «Новый OBS-ключ».`,
       disable_web_page_preview: true
     });
   }
+
+  async sendGoalLinks(userId, cfg) {
+    const origin = cfg.origin;
+    if (!origin) {
+      await tg(this.env, "sendMessage", { chat_id: userId, text: "⚠️ Ссылка цели появится после первого Telegram webhook-запроса." });
+      return;
+    }
+    const landscape = `${origin}/goal/landscape?key=${cfg.overlayKey}`;
+    const vertical = `${origin}/goal/vertical?key=${cfg.overlayKey}`;
+    await tg(this.env, "sendMessage", {
+      chat_id: userId,
+      text: `🎯 OBS Browser Source — цель сбора
+
+🖥 1920×1080:
+${landscape}
+
+📱 1080×1920:
+${vertical}
+
+Виджет сам синхронизирует текущий баланс Telegram Stars.`,
+      disable_web_page_preview: true
+    });
+  }
+
 }

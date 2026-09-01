@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>starchik Stars goal</title>
+<style>
+  *{box-sizing:border-box} html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent!important;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;color:#fff}
+  #wrap{position:fixed;left:50%;bottom:6vh;transform:translateX(-50%);width:min(760px,82vw);opacity:0;transition:opacity .35s,transform .35s;pointer-events:none}
+  body.vertical #wrap{bottom:9vh;width:min(900px,88vw)}
+  #wrap.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .box{padding:18px 22px 20px;border-radius:22px;border:1px solid rgba(255,255,255,.15);background:linear-gradient(135deg,rgba(15,18,30,.9),rgba(8,10,17,.84));box-shadow:0 18px 55px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08);backdrop-filter:blur(14px)}
+  body.vertical .box{padding:25px 28px 27px;border-radius:30px}
+  .top{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:11px}.title{font-size:22px;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.numbers{font-size:19px;font-weight:900;white-space:nowrap}.star{color:#ffd84d}
+  body.vertical .title{font-size:34px} body.vertical .numbers{font-size:28px}
+  .track{width:100%;height:24px;border-radius:999px;background:rgba(255,255,255,.10);overflow:hidden;box-shadow:inset 0 2px 7px rgba(0,0,0,.35)}
+  body.vertical .track{height:34px}
+  .progress{height:100%;width:0;border-radius:inherit;background:linear-gradient(90deg,#ff8a00,#ffc400,#ffe169);box-shadow:0 0 22px rgba(255,166,0,.38);transition:width .8s cubic-bezier(.2,.8,.2,1)}
+  .meta{margin-top:8px;display:flex;justify-content:space-between;font-size:13px;font-weight:700;opacity:.72} body.vertical .meta{font-size:18px;margin-top:11px}
+  #status{position:fixed;left:12px;bottom:10px;background:rgba(0,0,0,.42);padding:6px 9px;border-radius:8px;font:11px monospace;opacity:0}body.debug #status{opacity:.75}
+</style>
+</head>
+<body>
+<div id="wrap"><div class="box"><div class="top"><div class="title" id="title">Цель сбора</div><div class="numbers"><span class="star" id="current">0 ⭐</span> / <span id="target">1000 ⭐</span></div></div><div class="track"><div class="progress" id="progress"></div></div><div class="meta"><span id="percent">0%</span><span>Telegram Stars</span></div></div></div><div id="status">loading</div>
+<script>
+(() => {
+  const params=new URLSearchParams(location.search); const key=params.get('key')||''; const layout=location.pathname.includes('/vertical')?'vertical':'landscape';
+  document.body.classList.add(layout); if(params.get('debug')==='1')document.body.classList.add('debug');
+  const wrap=document.getElementById('wrap'),title=document.getElementById('title'),current=document.getElementById('current'),target=document.getElementById('target'),progress=document.getElementById('progress'),percent=document.getElementById('percent'),status=document.getElementById('status');
+  let reconnectDelay=800;
+  const setStatus=t=>status.textContent=t;
+  function render(goal){ if(!goal)return; title.textContent=goal.title||'Цель сбора'; current.textContent=`${Math.max(0,Number(goal.current)||0)} ⭐`; target.textContent=`${Math.max(1,Number(goal.target)||1)} ⭐`; const p=Math.max(0,Math.min(100,Number(goal.percent)||0)); progress.style.width=`${p}%`; percent.textContent=`${p.toFixed(p%1?1:0)}%`; wrap.classList.toggle('on',!!goal.enabled); setStatus(goal.stale?'stale balance':'online'); }
+  async function refresh(force=false){ if(!key)return setStatus('missing key'); try{const r=await fetch(`/goal-state?key=${encodeURIComponent(key)}${force?'&refresh=1':''}`,{cache:'no-store'});const d=await r.json();if(d.ok)render(d.goal);else setStatus(`goal ${r.status}`);}catch(e){setStatus('refresh error');}}
+  function connect(){ const proto=location.protocol==='https:'?'wss:':'ws:'; const ws=new WebSocket(`${proto}//${location.host}/ws?key=${encodeURIComponent(key)}&layout=${layout}&mode=goal`); setStatus('connecting'); ws.onopen=()=>{reconnectDelay=800;setStatus('online')}; ws.onmessage=e=>{if(e.data==='pong')return;let m;try{m=JSON.parse(e.data)}catch{return}if(m.type==='hello'&&m.data?.goal)render(m.data.goal);if(m.type==='goal')render(m.data)}; ws.onclose=()=>{setStatus('reconnecting');setTimeout(connect,reconnectDelay);reconnectDelay=Math.min(10000,Math.round(reconnectDelay*1.6))}; ws.onerror=()=>ws.close(); const ping=setInterval(()=>{if(ws.readyState===1)ws.send('ping');else clearInterval(ping)},25000); }
+  if(params.get('preview')==='1'){render({enabled:true,title:'На новое кресло',current:325,target:1000,percent:32.5});setStatus('preview');}else if(key){refresh(true);connect();setInterval(()=>refresh(true),30000);}else setStatus('missing key');
+})();
+</script>
+</body>
+</html>
