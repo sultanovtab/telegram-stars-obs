@@ -7,12 +7,20 @@ import {
   buildOrderPricing,
   buildStarInvoicePrices,
   findTierIndex,
-  goalProgress
+  goalProgress,
+  validatePreCheckout,
+  validateSuccessfulPayment,
+  buildPreCheckoutWebhookReply,
+  nextAlertSequence,
+  validateRefundedPayment
 } from "./v4-logic.js";
 
 const DEFAULT_AMOUNTS = [10, 25, 50, 100, 250, 500, 1000];
 const MAX_COMMENT = 140;
 const MAX_CUSTOM_STARS = 10000;
+const INVOICE_RATE_LIMIT_MS = 1500;
+const ORDER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const ORDER_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 const DEFAULT_TIERS = [
   { label: "1–24 ⭐", min: 1, max: 24, duration: 6000, animation: null, sound: null },
@@ -33,7 +41,11 @@ function json(data, status = 200, headers = {}) {
 function html(body, status = 200) {
   return new Response(body, {
     status,
-    headers: { "content-type": "text/html; charset=utf-8" }
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer"
+    }
   });
 }
 
@@ -76,6 +88,12 @@ async function resolveSecret(env, name) {
     return typeof resolved === "string" ? resolved : "";
   }
   return "";
+}
+
+async function resolveSecretWithFallback(env, preferred, fallback = "APP_SECRET") {
+  const primary = await resolveSecret(env, preferred);
+  if (primary) return primary;
+  return fallback ? resolveSecret(env, fallback) : "";
 }
 
 async function tg(env, method, body = {}) {
@@ -241,15 +259,18 @@ export default {
 
     if (url.pathname === "/bootstrap") {
       const code = url.searchParams.get("code") || "";
-      const appSecret = await resolveSecret(env, "APP_SECRET");
+      const setupSecret = await resolveSecretWithFallback(env, "SETUP_SECRET");
+      const claimSecret = await resolveSecretWithFallback(env, "CLAIM_SECRET");
+      const webhookSecret = await resolveSecretWithFallback(env, "TELEGRAM_WEBHOOK_SECRET");
       const botToken = await resolveSecret(env, "BOT_TOKEN");
-      if (!appSecret || code !== appSecret) return html("<h1>403</h1><p>Wrong setup code.</p>", 403);
+      if (!setupSecret || code !== setupSecret) return html("<h1>403</h1><p>Wrong setup code.</p>", 403);
       if (!botToken) return html("<h1>BOT_TOKEN is missing</h1>", 500);
+      if (!claimSecret || !webhookSecret) return html("<h1>Missing security secrets</h1>", 500);
 
       const webhookUrl = `${origin}/telegram`;
       const webhookResult = await tg(env, "setWebhook", {
         url: webhookUrl,
-        secret_token: appSecret,
+        secret_token: webhookSecret,
         allowed_updates: ["message", "callback_query", "pre_checkout_query"]
       });
       await tg(env, "setMyCommands", {
@@ -261,20 +282,29 @@ export default {
         ]
       });
 
-      return html(`<!doctype html><meta charset="utf-8"><title>starchik setup</title>
-      <style>body{font-family:system-ui;background:#0d1020;color:#fff;max-width:720px;margin:60px auto;padding:24px}code{background:#1b2140;padding:3px 7px;border-radius:7px}.ok{color:#82ffa1}</style>
+      const dedicatedSecrets = Boolean(
+        await resolveSecret(env, "SETUP_SECRET") &&
+        await resolveSecret(env, "CLAIM_SECRET") &&
+        await resolveSecret(env, "TELEGRAM_WEBHOOK_SECRET")
+      );
+      return html(`<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>starchik setup</title>
+      <style>body{font-family:system-ui;background:#0d1020;color:#fff;max-width:720px;margin:60px auto;padding:24px}code{background:#1b2140;padding:3px 7px;border-radius:7px}.ok{color:#82ffa1}.warn{color:#ffd479}</style>
       <h1 class="ok">✓ Webhook подключён</h1>
       <p>Telegram ответил: <code>${escapeHtml(String(webhookResult))}</code></p>
-      <p>Теперь открой <b>@${escapeHtml(env.BOT_USERNAME)}</b> и отправь:</p>
-      <p><code>/claim ${escapeHtml(appSecret)}</code></p>
+      ${dedicatedSecrets ? '<p class="ok">✓ Dedicated security secrets active.</p>' : '<p class="warn">⚠️ Пока используется совместимый APP_SECRET fallback. Добавь SETUP_SECRET, CLAIM_SECRET и TELEGRAM_WEBHOOK_SECRET в Cloudflare.</p>'}
+      <p>Если владелец ещё не назначен, открой <b>@${escapeHtml(env.BOT_USERNAME)}</b> и отправь:</p>
+      <p><code>/claim ${escapeHtml(claimSecret)}</code></p>
       <p>После успешного claim команда повторно владельца не сменит.</p>`);
     }
 
     if (url.pathname === "/telegram") {
       if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-      const appSecret = await resolveSecret(env, "APP_SECRET");
-      if (!appSecret || secret !== appSecret) return new Response("Forbidden", { status: 403 });
+      const dedicatedWebhookSecret = await resolveSecret(env, "TELEGRAM_WEBHOOK_SECRET");
+      const legacyWebhookSecret = await resolveSecret(env, "APP_SECRET");
+      const webhookSecret = dedicatedWebhookSecret || legacyWebhookSecret;
+      const acceptedSecrets = [webhookSecret, legacyWebhookSecret].filter(Boolean);
+      if (!acceptedSecrets.includes(secret)) return new Response("Forbidden", { status: 403 });
       const headers = new Headers(request.headers);
       headers.set("x-worker-origin", origin);
       const forwarded = new Request("https://hub.internal/telegram", {
@@ -316,6 +346,9 @@ export class StreamHub extends DurableObject {
     super(ctx, env);
     this.ctx = ctx;
     this.env = env;
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair("ping", "pong")
+    );
   }
 
   async config() {
@@ -407,7 +440,7 @@ export class StreamHub extends DurableObject {
     const cfg = await this.config();
     if (url.searchParams.get("key") !== cfg.overlayKey) return json({ ok: false }, 403);
     try {
-      return json({ ok: true, goal: await this.getGoalState(url.searchParams.get("refresh") === "1") });
+      return json({ ok: true, goal: await this.getGoalState(false) });
     } catch (error) {
       return json({ ok: false, error: String(error?.message || error) }, 502);
     }
@@ -418,7 +451,11 @@ export class StreamHub extends DurableObject {
     try { goal = await this.getGoalState(force); } catch { return; }
     const message = JSON.stringify({ type: "goal", data: goal });
     for (const ws of this.ctx.getWebSockets()) {
-      try { ws.send(message); } catch {}
+      try {
+        const attachment = ws.deserializeAttachment?.();
+        if (attachment?.mode !== "goal") continue;
+        ws.send(message);
+      } catch {}
     }
   }
 
@@ -440,7 +477,7 @@ export class StreamHub extends DurableObject {
       brand: this.env.BRAND_NAME,
       layout,
       mode,
-      recent: mode === "alerts" ? history.slice(-20) : [],
+      recent: mode === "alerts" ? history.slice(-100) : [],
       tiers: cfg.tiers.map((t, i) => ({ index: i, label: t.label, duration: t.duration, hasAnimation: !!t.animation, hasSound: !!t.sound }))
     };
     if (mode === "goal") {
@@ -452,7 +489,8 @@ export class StreamHub extends DurableObject {
   }
 
   webSocketMessage(ws, message) {
-    if (String(message) === "ping") ws.send("pong");
+    console.warn("starchik rejected unexpected WebSocket client message", String(message).slice(0, 120));
+    try { ws.close(1008, "Client messages are not accepted"); } catch {}
   }
 
   webSocketClose(ws) {
@@ -498,8 +536,7 @@ export class StreamHub extends DurableObject {
 
     try {
       if (update.pre_checkout_query) {
-        await this.handlePreCheckout(update.pre_checkout_query);
-        return json({ ok: true });
+        return json(await this.handlePreCheckout(update.pre_checkout_query));
       }
 
       const processed = (await this.ctx.storage.get("processedUpdates")) || [];
@@ -514,13 +551,19 @@ export class StreamHub extends DurableObject {
       return json({ ok: true });
     } catch (error) {
       console.error("Telegram update failed", error);
-      return json({ ok: false, error: String(error?.message || error) }, 200);
+      return json({ ok: false, error: "temporary_processing_failure" }, 503);
     }
   }
 
   async handleMessage(message) {
+    if (message.chat?.type !== "private") return;
+    if (message.refunded_payment) {
+      await this.handleRefundedPayment(message);
+      return;
+    }
+
     const user = message.from;
-    if (!user || message.chat?.type !== "private") return;
+    if (!user) return;
     const text = (message.text || "").trim();
     const userId = user.id;
 
@@ -536,8 +579,8 @@ export class StreamHub extends DurableObject {
         return;
       }
       const code = text.split(/\s+/).slice(1).join(" ");
-      const appSecret = await resolveSecret(this.env, "APP_SECRET");
-      if (!appSecret || code !== appSecret) {
+      const claimSecret = await resolveSecretWithFallback(this.env, "CLAIM_SECRET");
+      if (!claimSecret || code !== claimSecret) {
         await tg(this.env, "sendMessage", { chat_id: userId, text: "⛔ Неверный код владельца." });
         return;
       }
@@ -955,14 +998,61 @@ ${progress.current} / ${progress.target} ⭐ • ${progress.percent}%` });
       await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Тест ${cfg.tiers[tier].label} отправлен в OBS.` });
     } else if (action === "links") {
       await this.sendObsLinks(userId, cfg);
+    } else if (action === "refund") {
+      const payload = parts.slice(2).join(":");
+      const order = await this.ctx.storage.get(`order:${payload}`);
+      if (!order) {
+        await tg(this.env, "sendMessage", { chat_id: userId, text: "⚠️ Платёж не найден." });
+      } else if (order.status === "refunded") {
+        await tg(this.env, "sendMessage", { chat_id: userId, text: "↩️ Этот платёж уже возвращён." });
+      } else if (order.status !== "paid" || !order.telegramPaymentChargeId) {
+        await tg(this.env, "sendMessage", { chat_id: userId, text: "⚠️ Этот платёж сейчас нельзя вернуть." });
+      } else {
+        await tg(this.env, "sendMessage", {
+          chat_id: userId,
+          text: `⚠️ Подтвердить полный возврат ${order.totalAmount ?? order.amount} ⭐ пользователю ${order.user}?`,
+          reply_markup: { inline_keyboard: [
+            [callbackButton("↩️ Да, вернуть Stars", `adm:refundconfirm:${payload}`)],
+            [callbackButton("❌ Отмена", "adm:history")]
+          ] }
+        });
+      }
+    } else if (action === "refundconfirm") {
+      const payload = parts.slice(2).join(":");
+      try {
+        const result = await this.refundPaymentByPayload(payload);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: result.message, reply_markup: adminMenu() });
+      } catch (error) {
+        console.error("starchik refund failed", error);
+        await tg(this.env, "sendMessage", {
+          chat_id: userId,
+          text: `⚠️ Telegram не подтвердил возврат. Проверь историю перед повторной попыткой.
+${String(error?.message || error)}`,
+          reply_markup: adminMenu()
+        });
+      }
     } else if (action === "history") {
       const history = (await this.ctx.storage.get("history")) || [];
       const paid = history.filter(x => !x.test).slice(-10).reverse();
-      const body = paid.length ? paid.map((x, i) => `${i + 1}. ${x.user} — ${x.totalAmount ?? x.amount} ⭐${x.tts ? ` • 🔊 ${x.tts.label}` : ""}${x.comment ? `
-   “${x.comment}”` : ""}`).join("\n\n") : "Платежей пока нет.";
+      const lines = [];
+      const refundButtons = [];
+      for (let i = 0; i < paid.length; i++) {
+        const item = paid[i];
+        const order = item.payload ? await this.ctx.storage.get(`order:${item.payload}`) : null;
+        const status = order?.status === "refunded" ? " • ↩️ возврат" : "";
+        lines.push(`${i + 1}. ${item.user} — ${item.totalAmount ?? item.amount} ⭐${item.tts ? ` • 🔊 ${item.tts.label}` : ""}${status}${item.comment ? `
+   “${item.comment}”` : ""}`);
+        if (i < 5 && item.payload && order?.status === "paid" && order.telegramPaymentChargeId) {
+          refundButtons.push([callbackButton(`↩️ Возврат #${i + 1} • ${item.totalAmount ?? item.amount} ⭐`, `adm:refund:${item.payload}`)]);
+        }
+      }
+      const body = lines.length ? lines.join("\n\n") : "Платежей пока нет.";
+      const reply_markup = refundButtons.length
+        ? { inline_keyboard: [...refundButtons, [callbackButton("⬅️ Админка", "adm:home")]] }
+        : adminMenu();
       await tg(this.env, "sendMessage", { chat_id: userId, text: `📋 Последние платежи
 
-${body}` });
+${body}`, reply_markup });
     } else if (action === "rotate") {
       cfg.overlayKey = randomToken(24);
       await this.saveConfig(cfg);
@@ -1016,9 +1106,36 @@ ${body}` });
     });
   }
 
+  async cleanupStaleOrders(now = Date.now()) {
+    const lastCleanup = Number(await this.ctx.storage.get("lastOrderCleanup") || 0);
+    if (now - lastCleanup < ORDER_CLEANUP_INTERVAL_MS) return;
+
+    const orders = await this.ctx.storage.list({ prefix: "order:", limit: 200 });
+    const expired = [];
+    for (const [key, order] of orders) {
+      if (order?.status === "invoice_sent" && now - Number(order.createdAt || 0) > ORDER_RETENTION_MS) {
+        expired.push(key);
+      }
+    }
+    if (expired.length) await this.ctx.storage.delete(expired);
+    await this.ctx.storage.put("lastOrderCleanup", now);
+  }
+
   async createInvoice(user, baseAmount, comment, ttsProfile = null) {
+    const now = Date.now();
+    const invoiceRateKey = `invoiceRate:${user.id}`;
+    const lastInvoiceAt = Number(await this.ctx.storage.get(invoiceRateKey) || 0);
+    if (now - lastInvoiceAt < INVOICE_RATE_LIMIT_MS) {
+      await tg(this.env, "sendMessage", {
+        chat_id: user.id,
+        text: "⏳ Слишком быстро. Подожди пару секунд и создай платёж ещё раз."
+      });
+      return;
+    }
+    await this.cleanupStaleOrders(now);
+
     const pricing = buildOrderPricing(baseAmount, ttsProfile);
-    const payload = `st_${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    const payload = `st_${now.toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const order = {
       payload,
       userId: user.id,
@@ -1029,7 +1146,7 @@ ${body}` });
       ttsFee: pricing.ttsFee,
       tts: pricing.tts,
       comment: String(comment || "").slice(0, MAX_COMMENT),
-      createdAt: Date.now(),
+      createdAt: now,
       status: "invoice_sent"
     };
     await this.ctx.storage.put(`order:${payload}`, order);
@@ -1043,66 +1160,182 @@ ${body}` });
       currency: "XTR",
       prices
     });
+    await this.ctx.storage.put(invoiceRateKey, now);
   }
 
   async handlePreCheckout(query) {
-    const payload = query.invoice_payload;
-    const order = await this.ctx.storage.get(`order:${payload}`);
-    const valid = !!order && order.status !== "paid" && query.currency === "XTR" && Number(query.total_amount) === Number(order.totalAmount ?? order.amount) && Number(query.from?.id) === Number(order.userId);
-    await tg(this.env, "answerPreCheckoutQuery", valid
-      ? { pre_checkout_query_id: query.id, ok: true }
-      : { pre_checkout_query_id: query.id, ok: false, error_message: "Не удалось проверить заказ. Вернись в бот и создай новый платёж." }
-    );
+    const order = await this.ctx.storage.get(`order:${query.invoice_payload}`);
+    const validation = validatePreCheckout(order, query);
+    return buildPreCheckoutWebhookReply(query.id, validation);
+  }
+
+  async sendPaymentReceipt(record, message, cfg) {
+    if (record.receiptSent || record.status === "refunded") return record;
+    const order = record.order || {};
+    const detail = order.tts ? `\n🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
+    await tg(this.env, "sendMessage", {
+      chat_id: message.chat.id,
+      text: `💛 Спасибо! ${record.totalAmount} ⭐ получены.${detail}\nАлерт отправлен на стрим.${order.comment ? `\n\nТвой комментарий: “${order.comment}”` : ""}`,
+      reply_markup: mainMenu(cfg.amounts)
+    });
+    const updated = { ...record, receiptSent: true, receiptSentAt: Date.now() };
+    await this.ctx.storage.put(`payment:${record.chargeId}`, updated);
+    return updated;
   }
 
   async handleSuccessfulPayment(message) {
     const payment = message.successful_payment;
-    const payload = payment.invoice_payload;
-    const order = await this.ctx.storage.get(`order:${payload}`);
-    if (!order) return;
-    const totalAmount = Number(order.totalAmount ?? order.amount);
-    const baseAmount = Number(order.baseAmount ?? order.amount);
-    if (payment.currency !== "XTR" || Number(payment.total_amount) !== totalAmount) return;
+    const payload = payment?.invoice_payload;
+    const orderKey = `order:${payload}`;
+    const order = await this.ctx.storage.get(orderKey);
+    const validation = validateSuccessfulPayment(order, message);
+    if (!validation.ok) {
+      console.error("Rejected successful_payment", {
+        reason: validation.reason,
+        payload,
+        userId: message.from?.id,
+        currency: payment?.currency,
+        amount: payment?.total_amount
+      });
+      return;
+    }
 
-    const chargeId = payment.telegram_payment_charge_id;
-    const knownCharges = (await this.ctx.storage.get("charges")) || [];
-    if (knownCharges.includes(chargeId)) return;
-    knownCharges.push(chargeId);
-    if (knownCharges.length > 300) knownCharges.splice(0, knownCharges.length - 300);
-    await this.ctx.storage.put("charges", knownCharges);
-
-    order.status = "paid";
-    order.paidAt = Date.now();
-    order.telegramPaymentChargeId = chargeId;
-    await this.ctx.storage.put(`order:${payload}`, order);
-
+    const { chargeId, totalAmount, baseAmount } = validation;
+    const paymentKey = `payment:${chargeId}`;
     const cfg = await this.config();
-    const tier = findTierIndex(baseAmount, cfg.tiers);
-    const alert = {
-      id: chargeId,
-      ts: Date.now(),
-      user: order.user,
-      amount: totalAmount,
-      baseAmount,
-      totalAmount,
-      comment: order.comment,
-      tts: order.tts || null,
-      tier,
-      test: false
-    };
-    await this.emitAlert(alert, true);
+
+    let record = await this.ctx.storage.get(paymentKey);
+    if (!record) {
+      record = await this.ctx.storage.transaction(async txn => {
+        const existing = await txn.get(paymentKey);
+        if (existing) return existing;
+
+        const seq = nextAlertSequence(await txn.get("alertSeq"));
+        const history = (await txn.get("history")) || [];
+        const paidAt = Date.now();
+        const paidOrder = {
+          ...order,
+          status: "paid",
+          paidAt,
+          telegramPaymentChargeId: chargeId
+        };
+        const alert = {
+          id: chargeId,
+          seq,
+          ts: paidAt,
+          payload,
+          user: order.user,
+          amount: totalAmount,
+          baseAmount,
+          totalAmount,
+          comment: order.comment,
+          tts: order.tts || null,
+          tier: findTierIndex(baseAmount, cfg.tiers),
+          test: false
+        };
+        history.push(alert);
+        if (history.length > 100) history.splice(0, history.length - 100);
+
+        const paymentRecord = {
+          chargeId,
+          payload,
+          userId: order.userId,
+          totalAmount,
+          baseAmount,
+          status: "committed",
+          delivery: "pending",
+          receiptSent: false,
+          createdAt: paidAt,
+          order: paidOrder,
+          alert
+        };
+        await txn.put({
+          [paymentKey]: paymentRecord,
+          [orderKey]: paidOrder,
+          history,
+          alertSeq: seq
+        });
+        return paymentRecord;
+      });
+    }
+
+    if (record.payload !== payload || Number(record.userId) !== Number(order.userId)) {
+      throw new Error("Payment charge ID collision detected");
+    }
+    if (record.status === "refunded") return;
+
+    if (record.delivery !== "sent") {
+      await this.emitAlert(record.alert, false);
+      record = { ...record, delivery: "sent", deliveredAt: Date.now() };
+      await this.ctx.storage.put(paymentKey, record);
+      await this.broadcastGoal(true);
+    }
+
+    await this.sendPaymentReceipt(record, message, cfg);
+  }
+
+  async handleRefundedPayment(message) {
+    const refund = message.refunded_payment;
+    if (!refund) return;
+    const chargeId = String(refund.telegram_payment_charge_id || "").trim();
+    const payload = String(refund.invoice_payload || "");
+    if (!chargeId || !payload || refund.currency !== "XTR") return;
+
+    const paymentKey = `payment:${chargeId}`;
+    const orderKey = `order:${payload}`;
+    const [record, order] = await Promise.all([
+      this.ctx.storage.get(paymentKey),
+      this.ctx.storage.get(orderKey)
+    ]);
+    if (!record && !order) return;
+    const validation = validateRefundedPayment(order, record, refund);
+    if (!validation.ok) {
+      console.error("Rejected refunded_payment", { reason: validation.reason, payload, chargeId });
+      return;
+    }
+
+    const refundedAt = Date.now();
+    const updatedOrder = order ? {
+      ...order,
+      status: "refunded",
+      refundedAt,
+      telegramPaymentChargeId: chargeId
+    } : null;
+    const updatedRecord = record ? {
+      ...record,
+      status: "refunded",
+      refundedAt
+    } : null;
+    const entries = {};
+    if (updatedOrder) entries[orderKey] = updatedOrder;
+    if (updatedRecord) entries[paymentKey] = updatedRecord;
+    if (Object.keys(entries).length) await this.ctx.storage.put(entries);
     await this.broadcastGoal(true);
+  }
 
-    const detail = order.tts ? `
-🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
-    await tg(this.env, "sendMessage", {
-      chat_id: message.chat.id,
-      text: `💛 Спасибо! ${totalAmount} ⭐ получены.${detail}
-Алерт отправлен на стрим.${order.comment ? `
+  async refundPaymentByPayload(payload) {
+    const orderKey = `order:${payload}`;
+    const order = await this.ctx.storage.get(orderKey);
+    if (!order) return { ok: false, message: "Платёж не найден." };
+    if (order.status === "refunded") return { ok: false, message: "Этот платёж уже возвращён." };
+    if (order.status !== "paid" || !order.telegramPaymentChargeId) {
+      return { ok: false, message: "Этот платёж нельзя вернуть из текущего состояния." };
+    }
 
-Твой комментарий: “${order.comment}”` : ""}`,
-      reply_markup: mainMenu(cfg.amounts)
+    await tg(this.env, "refundStarPayment", {
+      user_id: order.userId,
+      telegram_payment_charge_id: order.telegramPaymentChargeId
     });
+
+    const refundedAt = Date.now();
+    const paymentKey = `payment:${order.telegramPaymentChargeId}`;
+    const record = await this.ctx.storage.get(paymentKey);
+    const updatedOrder = { ...order, status: "refunded", refundedAt };
+    const entries = { [orderKey]: updatedOrder };
+    if (record) entries[paymentKey] = { ...record, status: "refunded", refundedAt };
+    await this.ctx.storage.put(entries);
+    await this.broadcastGoal(true);
+    return { ok: true, message: `↩️ Возврат ${order.totalAmount ?? order.amount} ⭐ отправлен через Telegram.` };
   }
 
   async emitAlert(alert, persist) {
@@ -1114,7 +1347,11 @@ ${body}` });
     }
     const message = JSON.stringify({ type: "alert", data: alert });
     for (const ws of this.ctx.getWebSockets()) {
-      try { ws.send(message); } catch {}
+      try {
+        const attachment = ws.deserializeAttachment?.();
+        if (attachment?.mode !== "alerts") continue;
+        ws.send(message);
+      } catch {}
     }
   }
 

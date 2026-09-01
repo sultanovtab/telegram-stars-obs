@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
 <title>starchik OBS overlay</title>
 <style>
   :root { color-scheme:dark; --accent:#ffd84d; --glass:rgba(10,13,22,.84); --edge:rgba(255,255,255,.14); }
@@ -58,8 +59,14 @@ let playing = false;
 let helloReceived = false;
 let reconnectDelay = 800;
 let tierDurations = [6000,6500,7000,7500,8500,10000];
-const storageKey = `starchik_last_seen_${layout}`;
-let lastSeen = Number(localStorage.getItem(storageKey) || 0);
+const storageKey = `starchik_last_seen_seq_v1_${layout}`;
+const legacyStorageKey = `starchik_last_seen_${layout}`;
+let lastSeenSeq = Number(localStorage.getItem(storageKey) || 0);
+const legacyLastSeenTs = Number(localStorage.getItem(legacyStorageKey) || 0);
+const alertSeq = alert => {
+  const seq = Number(alert.seq || 0);
+  return Number.isFinite(seq) && seq > 0 ? seq : 0;
+};
 
 const setStatus = txt => status.textContent = txt;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -75,9 +82,10 @@ function remember(alert) {
 function enqueue(alert) {
   if (!remember(alert)) return;
   queue.push(alert);
-  if (alert.ts) {
-    lastSeen = Math.max(lastSeen, Number(alert.ts));
-    localStorage.setItem(storageKey, String(lastSeen));
+  const seq = alertSeq(alert);
+  if (seq) {
+    lastSeenSeq = Math.max(lastSeenSeq, seq);
+    localStorage.setItem(storageKey, String(lastSeenSeq));
   }
   pump();
 }
@@ -141,12 +149,19 @@ async function speakComment(text, profile) {
       done();
     }, ttsTimeoutMs(clean));
     utter.onend = done;
-    utter.onerror = done;
+    utter.onerror = event => {
+      const reason = event?.error || 'unknown';
+      console.error("starchik TTS error", { error: reason, profile: profile.id || profile.label || 'unknown' });
+      setStatus(`TTS error: ${reason}; text kept visible`);
+      done();
+    };
     try {
       speechSynthesis.cancel();
       speechSynthesis.speak(utter);
       setStatus(`speaking: ${profile.label || 'TTS'}`);
-    } catch {
+    } catch (error) {
+      console.error("starchik TTS exception", error);
+      setStatus('TTS error: exception; text kept visible');
       done();
     }
   });
@@ -220,12 +235,26 @@ function connect() {
     if (msg.type === 'hello') {
       const recent = msg.data?.recent || [];
       if (Array.isArray(msg.data?.tiers)) tierDurations = msg.data.tiers.map(x => Number(x.duration) || 7000);
-      if (!helloReceived && !lastSeen) {
-        for (const item of recent) remember(item);
-        const newest = recent.reduce((m,x)=>Math.max(m,Number(x.ts||0)),0);
-        if (newest) { lastSeen = newest; localStorage.setItem(storageKey,String(lastSeen)); }
+      if (!helloReceived && !lastSeenSeq) {
+        if (legacyLastSeenTs) {
+          recent
+            .filter(x => alertSeq(x) > 0 && Number(x.ts || 0) > legacyLastSeenTs)
+            .forEach(enqueue);
+          const newest = recent.reduce((m, x) => Math.max(m, alertSeq(x)), 0);
+          if (newest > lastSeenSeq) {
+            lastSeenSeq = newest;
+            localStorage.setItem(storageKey, String(lastSeenSeq));
+          }
+        } else {
+          for (const item of recent) remember(item);
+          const newest = recent.reduce((m, x) => Math.max(m, alertSeq(x)), 0);
+          if (newest) {
+            lastSeenSeq = newest;
+            localStorage.setItem(storageKey, String(lastSeenSeq));
+          }
+        }
       } else {
-        recent.filter(x => Number(x.ts||0) > lastSeen).forEach(enqueue);
+        recent.filter(x => alertSeq(x) > lastSeenSeq).forEach(enqueue);
       }
       helloReceived = true;
     } else if (msg.type === 'alert') enqueue(msg.data);

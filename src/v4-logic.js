@@ -76,3 +76,67 @@ export function buildStarInvoicePrices(pricing) {
   const total = Math.max(1, Math.trunc(Number(pricing?.totalAmount) || 0));
   return [{ label: pricing?.tts ? 'Поддержка + озвучка' : 'Поддержка', amount: total }];
 }
+
+export function validatePreCheckout(order, query = {}) {
+  if (!order) return { ok: false, reason: 'order_not_found' };
+  if (order.status !== 'invoice_sent') return { ok: false, reason: 'order_not_payable' };
+  if (String(query.invoice_payload || '') !== String(order.payload || '')) return { ok: false, reason: 'payload_mismatch' };
+  if (query.currency !== 'XTR') return { ok: false, reason: 'currency_mismatch' };
+  if (Number(query.total_amount) !== Number(order.totalAmount ?? order.amount)) return { ok: false, reason: 'amount_mismatch' };
+  if (Number(query.from?.id) !== Number(order.userId)) return { ok: false, reason: 'user_mismatch' };
+  return { ok: true, reason: 'ok' };
+}
+
+export function validateSuccessfulPayment(order, message = {}) {
+  const payment = message.successful_payment;
+  if (!order || !payment) return { ok: false, reason: 'order_or_payment_missing' };
+  if (String(payment.invoice_payload || '') !== String(order.payload || '')) return { ok: false, reason: 'payload_mismatch' };
+  if (payment.currency !== 'XTR') return { ok: false, reason: 'currency_mismatch' };
+  const totalAmount = Number(order.totalAmount ?? order.amount);
+  if (Number(payment.total_amount) !== totalAmount) return { ok: false, reason: 'amount_mismatch' };
+  if (Number(message.from?.id) !== Number(order.userId)) return { ok: false, reason: 'user_mismatch' };
+  const chargeId = String(payment.telegram_payment_charge_id || '').trim();
+  if (!chargeId) return { ok: false, reason: 'charge_id_missing' };
+  return {
+    ok: true,
+    reason: 'ok',
+    chargeId,
+    totalAmount,
+    baseAmount: Number(order.baseAmount ?? order.amount)
+  };
+}
+
+export function buildPreCheckoutWebhookReply(queryId, validation) {
+  if (validation?.ok) {
+    return {
+      method: 'answerPreCheckoutQuery',
+      pre_checkout_query_id: queryId,
+      ok: true
+    };
+  }
+  return {
+    method: 'answerPreCheckoutQuery',
+    pre_checkout_query_id: queryId,
+    ok: false,
+    error_message: 'Не удалось проверить заказ. Вернись в бот и создай новый платёж.'
+  };
+}
+
+export function nextAlertSequence(value) {
+  const n = Math.trunc(Number(value));
+  return Number.isFinite(n) && n >= 0 ? n + 1 : 1;
+}
+
+export function validateRefundedPayment(order, record, refund = {}) {
+  const chargeId = String(refund.telegram_payment_charge_id || '').trim();
+  const payload = String(refund.invoice_payload || '');
+  if (!chargeId || !payload) return { ok: false, reason: 'refund_identity_missing' };
+  if (refund.currency !== 'XTR') return { ok: false, reason: 'currency_mismatch' };
+  if (order?.payload && String(order.payload) !== payload) return { ok: false, reason: 'payload_mismatch' };
+  if (record?.payload && String(record.payload) !== payload) return { ok: false, reason: 'payload_mismatch' };
+  if (order?.telegramPaymentChargeId && String(order.telegramPaymentChargeId) !== chargeId) return { ok: false, reason: 'charge_id_mismatch' };
+  if (record?.chargeId && String(record.chargeId) !== chargeId) return { ok: false, reason: 'charge_id_mismatch' };
+  const expected = Number(record?.totalAmount ?? order?.totalAmount ?? order?.amount);
+  if (Number.isFinite(expected) && Number(refund.total_amount) !== expected) return { ok: false, reason: 'amount_mismatch' };
+  return { ok: true, reason: 'ok', chargeId, payload, totalAmount: expected };
+}
