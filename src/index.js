@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { overlayAssetUrl } from "./overlay-route.js";
 
 const DEFAULT_AMOUNTS = [10, 25, 50, 100, 250, 500, 1000];
 const MAX_COMMENT = 140;
@@ -58,9 +59,20 @@ function chunkButtons(items, perRow = 3) {
   return rows;
 }
 
+async function resolveSecret(env, name) {
+  const value = env?.[name];
+  if (typeof value === "string") return value;
+  if (value && typeof value.get === "function") {
+    const resolved = await value.get();
+    return typeof resolved === "string" ? resolved : "";
+  }
+  return "";
+}
+
 async function tg(env, method, body = {}) {
-  if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN secret is missing");
-  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+  const botToken = await resolveSecret(env, "BOT_TOKEN");
+  if (!botToken) throw new Error("BOT_TOKEN secret is missing");
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
@@ -76,7 +88,9 @@ async function tg(env, method, body = {}) {
 async function getTelegramFile(env, fileId) {
   const info = await tg(env, "getFile", { file_id: fileId });
   if (!info?.file_path) throw new Error("Telegram did not return file_path");
-  const source = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`);
+  const botToken = await resolveSecret(env, "BOT_TOKEN");
+  if (!botToken) throw new Error("BOT_TOKEN secret is missing");
+  const source = await fetch(`https://api.telegram.org/file/bot${botToken}/${info.file_path}`);
   if (!source.ok) throw new Error(`Telegram file download failed: ${source.status}`);
   return source;
 }
@@ -185,13 +199,15 @@ export default {
 
     if (url.pathname === "/bootstrap") {
       const code = url.searchParams.get("code") || "";
-      if (!env.APP_SECRET || code !== env.APP_SECRET) return html("<h1>403</h1><p>Wrong setup code.</p>", 403);
-      if (!env.BOT_TOKEN) return html("<h1>BOT_TOKEN is missing</h1>", 500);
+      const appSecret = await resolveSecret(env, "APP_SECRET");
+      const botToken = await resolveSecret(env, "BOT_TOKEN");
+      if (!appSecret || code !== appSecret) return html("<h1>403</h1><p>Wrong setup code.</p>", 403);
+      if (!botToken) return html("<h1>BOT_TOKEN is missing</h1>", 500);
 
       const webhookUrl = `${origin}/telegram`;
       const webhookResult = await tg(env, "setWebhook", {
         url: webhookUrl,
-        secret_token: env.APP_SECRET,
+        secret_token: appSecret,
         allowed_updates: ["message", "callback_query", "pre_checkout_query"]
       });
       await tg(env, "setMyCommands", {
@@ -208,14 +224,15 @@ export default {
       <h1 class="ok">✓ Webhook подключён</h1>
       <p>Telegram ответил: <code>${escapeHtml(String(webhookResult))}</code></p>
       <p>Теперь открой <b>@${escapeHtml(env.BOT_USERNAME)}</b> и отправь:</p>
-      <p><code>/claim ${escapeHtml(env.APP_SECRET)}</code></p>
+      <p><code>/claim ${escapeHtml(appSecret)}</code></p>
       <p>После успешного claim команда повторно владельца не сменит.</p>`);
     }
 
     if (url.pathname === "/telegram") {
       if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-      if (!env.APP_SECRET || secret !== env.APP_SECRET) return new Response("Forbidden", { status: 403 });
+      const appSecret = await resolveSecret(env, "APP_SECRET");
+      if (!appSecret || secret !== appSecret) return new Response("Forbidden", { status: 403 });
       const headers = new Headers(request.headers);
       headers.set("x-worker-origin", origin);
       const forwarded = new Request("https://hub.internal/telegram", {
@@ -237,7 +254,7 @@ export default {
     }
 
     if (url.pathname === "/overlay/landscape" || url.pathname === "/overlay/vertical") {
-      const assetUrl = new URL("/overlay.html", request.url);
+      const assetUrl = overlayAssetUrl(request.url);
       const assetRequest = new Request(assetUrl, request);
       return env.ASSETS.fetch(assetRequest);
     }
@@ -403,7 +420,8 @@ export class StreamHub extends DurableObject {
         return;
       }
       const code = text.split(/\s+/).slice(1).join(" ");
-      if (!this.env.APP_SECRET || code !== this.env.APP_SECRET) {
+      const appSecret = await resolveSecret(this.env, "APP_SECRET");
+      if (!appSecret || code !== appSecret) {
         await tg(this.env, "sendMessage", { chat_id: userId, text: "⛔ Неверный код владельца." });
         return;
       }
