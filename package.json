@@ -1,13 +1,13 @@
 {
   "name": "telegram-stars-obs",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "private": true,
-  "description": "Telegram Stars alerts for OBS/TikTok — starchik v5 hardened",
+  "description": "Telegram Stars alerts for OBS/TikTok — starchik v5.1 duplicate-webhook hotfix",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node --check src/index.js && node --check src/v4-logic.js && node --check src/overlay-route.js",
+    "check": "node --check src/index.js && node --check src/v4-logic.js && node --check src/overlay-route.js && node --check src/update-dedupe.js && node --check src/payment-receipt.js",
     "test": "node --test tests/*.test.mjs",
     "verify": "npm test && npm run check"
   },

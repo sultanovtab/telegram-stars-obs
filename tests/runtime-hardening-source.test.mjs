@@ -88,3 +88,26 @@ test('invoice spam cooldown is recorded only after sendInvoice succeeds so webho
   const rateWrite = section.indexOf('storage.put(invoiceRateKey, now)');
   assert.ok(sendInvoice >= 0 && rateWrite > sendInvoice, 'rate-limit timestamp must be written after successful sendInvoice');
 });
+
+test('ordinary Telegram updates are atomically reserved before any bot side effects', () => {
+  const start = worker.indexOf('async handleTelegram');
+  const end = worker.indexOf('async handleMessage', start);
+  const section = worker.slice(start, end);
+  const reserve = section.indexOf('reserveTelegramUpdate');
+  const callback = section.indexOf('handleCallback');
+  const message = section.indexOf('handleMessage');
+  assert.ok(reserve >= 0, 'handleTelegram must reserve ordinary updates');
+  assert.ok(reserve < callback, 'reservation must happen before callback side effects');
+  assert.ok(reserve < message, 'reservation must happen before message side effects');
+  assert.match(section, /isPaymentCriticalUpdate/);
+  assert.match(section, /duplicate Telegram update suppressed/);
+});
+
+test('payment thank-you receipt is transactionally claimed before sendMessage to suppress concurrent retries', () => {
+  const start = worker.indexOf('async sendPaymentReceipt');
+  const end = worker.indexOf('async handleSuccessfulPayment', start);
+  const section = worker.slice(start, end);
+  const claim = section.indexOf('claimPaymentReceipt');
+  const send = section.indexOf('sendMessage');
+  assert.ok(claim >= 0 && send > claim, 'payment receipt must be claimed before sending Telegram message');
+});

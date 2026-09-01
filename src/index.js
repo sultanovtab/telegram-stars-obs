@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { overlayAssetUrl, goalAssetUrl } from "./overlay-route.js";
+import { isPaymentCriticalUpdate, reserveTelegramUpdate, telegramUpdateFingerprint } from "./update-dedupe.js";
+import { claimPaymentReceipt, completePaymentReceipt, failPaymentReceipt } from "./payment-receipt.js";
 import {
   DEFAULT_TTS_PROFILES,
   normalizeConfigV4,
@@ -539,18 +541,33 @@ export class StreamHub extends DurableObject {
         return json(await this.handlePreCheckout(update.pre_checkout_query));
       }
 
-      const processed = (await this.ctx.storage.get("processedUpdates")) || [];
-      if (processed.includes(update.update_id)) return json({ ok: true, duplicate: true });
+      const paymentCritical = isPaymentCriticalUpdate(update);
+      const fingerprint = telegramUpdateFingerprint(update);
+      if (!paymentCritical) {
+        const reserved = await reserveTelegramUpdate(this.ctx.storage, update);
+        if (!reserved) {
+          console.info("starchik duplicate Telegram update suppressed", {
+            updateId: update.update_id,
+            fingerprint
+          });
+          return json({ ok: true, duplicate: true });
+        }
+        console.info("starchik Telegram update reserved", {
+          updateId: update.update_id,
+          fingerprint
+        });
+      }
 
       if (update.callback_query) await this.handleCallback(update.callback_query);
       if (update.message) await this.handleMessage(update.message);
-
-      processed.push(update.update_id);
-      if (processed.length > 200) processed.splice(0, processed.length - 200);
-      await this.ctx.storage.put("processedUpdates", processed);
       return json({ ok: true });
     } catch (error) {
-      console.error("Telegram update failed", error);
+      console.error("Telegram update failed", {
+        updateId: update.update_id,
+        fingerprint: telegramUpdateFingerprint(update),
+        paymentCritical: isPaymentCriticalUpdate(update),
+        error: String(error?.stack || error?.message || error)
+      });
       return json({ ok: false, error: "temporary_processing_failure" }, 503);
     }
   }
@@ -1171,16 +1188,27 @@ ${body}`, reply_markup });
 
   async sendPaymentReceipt(record, message, cfg) {
     if (record.receiptSent || record.status === "refunded") return record;
-    const order = record.order || {};
-    const detail = order.tts ? `\n🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
-    await tg(this.env, "sendMessage", {
-      chat_id: message.chat.id,
-      text: `💛 Спасибо! ${record.totalAmount} ⭐ получены.${detail}\nАлерт отправлен на стрим.${order.comment ? `\n\nТвой комментарий: “${order.comment}”` : ""}`,
-      reply_markup: mainMenu(cfg.amounts)
-    });
-    const updated = { ...record, receiptSent: true, receiptSentAt: Date.now() };
-    await this.ctx.storage.put(`payment:${record.chargeId}`, updated);
-    return updated;
+    const claim = await claimPaymentReceipt(this.ctx.storage, record.chargeId);
+    if (!claim.claimed) return claim.record || record;
+
+    const claimedRecord = claim.record;
+    const order = claimedRecord.order || {};
+    const detail = order.tts ? `
+🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
+    try {
+      await tg(this.env, "sendMessage", {
+        chat_id: message.chat.id,
+        text: `💛 Спасибо! ${claimedRecord.totalAmount} ⭐ получены.${detail}
+Алерт отправлен на стрим.${order.comment ? `
+
+Твой комментарий: “${order.comment}”` : ""}`,
+        reply_markup: mainMenu(cfg.amounts)
+      });
+      return completePaymentReceipt(this.ctx.storage, claimedRecord);
+    } catch (error) {
+      await failPaymentReceipt(this.ctx.storage, claimedRecord, error);
+      throw error;
+    }
   }
 
   async handleSuccessfulPayment(message) {

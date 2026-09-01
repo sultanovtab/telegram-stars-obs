@@ -1,8 +1,24 @@
-# starchik v5 — Telegram Stars → OBS (hardening)
+# starchik v5.1 — Telegram Stars → OBS (duplicate webhook hotfix)
 
 Cloudflare Worker для `@ttt_stars_bot`.
 
 v5 не меняет основную архитектуру: Telegram Bot API + Cloudflare Workers + один SQLite-backed Durable Object + hibernating WebSockets + OBS Browser Source. Обновление усиливает надёжность платежей, безопасность и reconnect, не сбрасывая текущие настройки Durable Object.
+
+## v5.1 hotfix: почему бот отвечал 4 раза
+
+После v5 Telegram мог одновременно повторить один и тот же webhook Update, а старая защита записывала `update_id` только **после** `sendMessage` / `answerCallbackQuery`. Пока первый запрос ждал Telegram API, ещё несколько retry успевали пройти ту же проверку и каждый отправлял ответ.
+
+v5.1 исправляет это так:
+
+- обычные `message` и `callback_query` получают стабильный fingerprint (`message:<chat>:<message_id>` / `callback:<callback_id>`);
+- fingerprint и `update_id` резервируются **атомарно в Durable Object transaction до любых внешних side effects**;
+- если Telegram одновременно прислал 4 копии одного Update, только первая обрабатывается, остальные сразу получают `200 { duplicate: true }`;
+- старый `processedUpdates` учитывается при миграции, поэтому уже обработанные v5 Update не оживут после deploy;
+- `pre_checkout_query`, `successful_payment` и `refunded_payment` специально не блокируются ранней reservation — для них остаётся payment-safe идемпотентность и retry semantics;
+- в Cloudflare Logs теперь видны `updateId` и fingerprint для reserved/suppressed Updates.
+- thank-you сообщение после `successful_payment` тоже получает атомарный receipt-claim, поэтому параллельные retry не отправят 4 одинаковых «Спасибо».
+
+Никакие существующие Stars, OBS URL, GIF/звуки, TTS, goal, admin ID и Durable Object данные при обновлении не сбрасываются. Новые секреты добавлять или менять для v5.1 не нужно.
 
 ## Что изменилось по сравнению с v4
 
