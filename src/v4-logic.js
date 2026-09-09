@@ -12,8 +12,71 @@ export const DEFAULT_GOAL = {
   target: 1000
 };
 
+export const DEFAULT_VIEWER_MEDIA = {
+  enabled: false,
+  price: 25,
+  allowPhoto: true,
+  allowSticker: true,
+  maxBytes: 10 * 1024 * 1024
+};
+
 function clone(value) {
   return value == null ? value : structuredClone(value);
+}
+
+export function sanitizeDisplayName(name) {
+  if (name == null) return 'Unknown';
+  let str = String(name)
+    .replace(/[\r\n\t]/g, ' ')
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (str.length > 30) {
+    str = str.slice(0, 30).trim();
+  }
+  if (!str || str.toLowerCase() === 'anonymous' || str.toLowerCase() === 'аноним') {
+    return 'Unknown';
+  }
+  return str;
+}
+
+export function validateViewerMedia(media, config = {}) {
+  const mediaConfig = { ...DEFAULT_VIEWER_MEDIA, ...(config.viewerMedia || config) };
+  if (!mediaConfig.enabled) {
+    return { ok: false, reason: 'viewer_media_disabled' };
+  }
+  if (!media || typeof media !== 'object') {
+    return { ok: false, reason: 'media_missing' };
+  }
+  const type = String(media.type || '').toLowerCase();
+  const size = Number(media.file_size) || 0;
+  const maxBytes = Number(mediaConfig.maxBytes) || DEFAULT_VIEWER_MEDIA.maxBytes;
+
+  if (size > maxBytes) {
+    return { ok: false, reason: 'file_too_large' };
+  }
+
+  if (type === 'photo') {
+    if (!mediaConfig.allowPhoto) return { ok: false, reason: 'photo_not_allowed' };
+    return { ok: true, reason: 'ok' };
+  }
+
+  if (type === 'sticker') {
+    if (!mediaConfig.allowSticker) return { ok: false, reason: 'sticker_not_allowed' };
+    if (media.is_animated) return { ok: false, reason: 'tgs_sticker_unsupported' };
+    if (media.is_video) return { ok: false, reason: 'video_sticker_unsupported' };
+    const mime = String(media.mime_type || '').toLowerCase();
+    if (mime && mime !== 'image/webp') return { ok: false, reason: 'unsupported_sticker_mime' };
+    return { ok: true, reason: 'ok' };
+  }
+
+  return { ok: false, reason: 'unsupported_media_type' };
+}
+
+export function calculatePlayAt(paidAt, alertDelayMs) {
+  const delay = Math.max(0, Math.trunc(Number(alertDelayMs ?? 10000)));
+  const baseTime = Number(paidAt) || Date.now();
+  return baseTime + delay;
 }
 
 export function normalizeConfigV4(cfg = {}) {
@@ -28,6 +91,8 @@ export function normalizeConfigV4(cfg = {}) {
   next.goal.title = String(next.goal.title || DEFAULT_GOAL.title).slice(0, 80);
   const target = Math.trunc(Number(next.goal.target));
   next.goal.target = Number.isFinite(target) && target > 0 ? target : DEFAULT_GOAL.target;
+  next.alertDelayMs = Math.max(0, Math.trunc(Number(cfg.alertDelayMs ?? 10000)));
+  next.viewerMedia = { ...DEFAULT_VIEWER_MEDIA, ...(cfg.viewerMedia || {}) };
   if (Array.isArray(cfg.tiers)) next.tiers = clone(cfg.tiers);
   if (Array.isArray(cfg.amounts)) next.amounts = clone(cfg.amounts);
   return next;
@@ -37,16 +102,18 @@ export function enabledTtsProfiles(profiles = []) {
   return profiles.filter(p => p && p.enabled && Number(p.price) >= 0);
 }
 
-export function buildOrderPricing(baseAmount, profile = null) {
+export function buildOrderPricing(baseAmount, profile = null, mediaFee = 0) {
   const base = Math.max(1, Math.trunc(Number(baseAmount) || 0));
+  const mFee = Math.max(0, Math.trunc(Number(mediaFee) || 0));
   if (!profile?.enabled) {
-    return { baseAmount: base, ttsFee: 0, totalAmount: base, tts: null };
+    return { baseAmount: base, ttsFee: 0, mediaFee: mFee, totalAmount: base + mFee, tts: null };
   }
   const fee = Math.max(0, Math.trunc(Number(profile.price) || 0));
   return {
     baseAmount: base,
     ttsFee: fee,
-    totalAmount: base + fee,
+    mediaFee: mFee,
+    totalAmount: base + fee + mFee,
     tts: {
       id: String(profile.id || 'standard'),
       label: String(profile.label || 'Озвучка'),
@@ -74,7 +141,15 @@ export function goalProgress(currentBalance, targetAmount) {
 
 export function buildStarInvoicePrices(pricing) {
   const total = Math.max(1, Math.trunc(Number(pricing?.totalAmount) || 0));
-  return [{ label: pricing?.tts ? 'Поддержка + озвучка' : 'Поддержка', amount: total }];
+  let label = 'Поддержка';
+  if (pricing?.tts && pricing?.mediaFee) {
+    label = 'Поддержка + озвучка + медиа';
+  } else if (pricing?.tts) {
+    label = 'Поддержка + озвучка';
+  } else if (pricing?.mediaFee) {
+    label = 'Поддержка + медиа';
+  }
+  return [{ label, amount: total }];
 }
 
 export function validatePreCheckout(order, query = {}) {

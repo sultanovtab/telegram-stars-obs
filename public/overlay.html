@@ -11,31 +11,38 @@
   html,body { width:100%; height:100%; margin:0; overflow:hidden; background:transparent!important; font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif; }
   #stage { position:fixed; inset:0; pointer-events:none; display:flex; justify-content:center; align-items:flex-start; padding-top:7vh; }
   body.vertical #stage { padding-top:10vh; }
-  .alert { width:min(760px,80vw); display:grid; justify-items:center; gap:10px; opacity:0; transform:translateY(-34px) scale(.92); filter:blur(6px); }
-  body.vertical .alert { width:min(900px,90vw); }
+  .alert { width:min(780px,82vw); display:grid; justify-items:center; gap:12px; opacity:0; transform:translateY(-34px) scale(.92); filter:blur(6px); }
+  body.vertical .alert { width:min(920px,92vw); }
   .alert.show { animation:enter .55s cubic-bezier(.2,.9,.22,1.22) forwards; }
   .alert.hide { animation:leave .45s ease forwards; }
   @keyframes enter { to { opacity:1; transform:translateY(0) scale(1); filter:blur(0); } }
   @keyframes leave { to { opacity:0; transform:translateY(-25px) scale(.96); filter:blur(5px); } }
-  .media { width:260px; height:210px; display:grid; place-items:center; position:relative; }
-  body.vertical .media { width:360px; height:300px; }
+  .media-wrapper { display:flex; align-items:center; justify-content:center; gap:16px; flex-wrap:nowrap; }
+  .media { width:240px; height:190px; display:grid; place-items:center; position:relative; }
+  body.vertical .media { width:320px; height:260px; }
   .media img,.media video { max-width:100%; max-height:100%; object-fit:contain; filter:drop-shadow(0 14px 30px rgba(0,0,0,.38)); }
+  .viewer-media { width:180px; height:180px; display:grid; place-items:center; position:relative; border-radius:18px; overflow:hidden; border:2px solid rgba(255,216,77,.4); background:rgba(0,0,0,.25); box-shadow:0 12px 28px rgba(0,0,0,.4); }
+  body.vertical .viewer-media { width:240px; height:240px; border-radius:24px; }
+  .viewer-media img { max-width:100%; max-height:100%; object-fit:contain; }
   .fallback-star { font-size:118px; line-height:1; filter:drop-shadow(0 10px 20px rgba(255,205,42,.34)); animation:starPop 1.15s ease-in-out infinite alternate; }
   body.vertical .fallback-star { font-size:170px; }
   @keyframes starPop { from{transform:translateY(6px) rotate(-5deg) scale(.94)} to{transform:translateY(-7px) rotate(5deg) scale(1.06)} }
-  .card { width:100%; padding:20px 28px 22px; border:1px solid var(--edge); border-radius:26px; background:linear-gradient(135deg,rgba(15,18,30,.93),rgba(9,11,18,.84)); box-shadow:0 22px 60px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(16px); text-align:center; }
-  body.vertical .card { padding:28px 34px 32px; border-radius:34px; }
+  .card { width:100%; padding:22px 30px 24px; border:1px solid var(--edge); border-radius:28px; background:linear-gradient(135deg,rgba(15,18,30,.93),rgba(9,11,18,.84)); box-shadow:0 22px 60px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(16px); text-align:center; }
+  body.vertical .card { padding:30px 36px 34px; border-radius:36px; }
   .eyebrow { font-weight:800; letter-spacing:.08em; text-transform:uppercase; font-size:14px; opacity:.72; }
   body.vertical .eyebrow { font-size:20px; }
-  .headline { margin-top:6px; font-weight:900; font-size:34px; line-height:1.1; text-shadow:0 2px 18px rgba(0,0,0,.35); }
-  body.vertical .headline { font-size:50px; }
+  .headline { margin-top:6px; font-weight:900; font-size:36px; line-height:1.15; text-shadow:0 2px 18px rgba(0,0,0,.35); word-break:break-word; }
+  body.vertical .headline { font-size:52px; }
+  .donor-name { color:#ffffff; }
   .amount { color:var(--accent); white-space:nowrap; }
   .tts-badge { display:none; margin:11px auto 0; width:max-content; max-width:100%; padding:6px 12px; border-radius:999px; background:rgba(255,216,77,.14); border:1px solid rgba(255,216,77,.32); color:#ffe989; font-weight:800; font-size:14px; }
   body.vertical .tts-badge { font-size:20px; padding:8px 16px; }
   .tts-badge.on { display:block; }
-  .comment { margin-top:11px; font-size:22px; line-height:1.36; font-weight:650; overflow-wrap:anywhere; text-wrap:balance; }
-  body.vertical .comment { margin-top:16px; font-size:31px; }
+  .comment { margin-top:14px; font-size:24px; line-height:1.4; font-weight:650; overflow-wrap:anywhere; text-wrap:balance; }
+  body.vertical .comment { margin-top:18px; font-size:34px; }
   .comment:empty { display:none; }
+  .k-word { display:inline-block; padding:0 2px; border-radius:4px; transition:background .15s ease, color .15s ease; }
+  .k-word.active { background:rgba(255,216,77,.35); color:#ffe989; text-shadow:0 0 8px rgba(255,216,77,.5); }
   .status { position:fixed; left:16px; bottom:12px; padding:7px 10px; border-radius:10px; background:rgba(0,0,0,.42); font:12px/1.2 monospace; color:#fff; opacity:0; transition:opacity .2s; }
   body.debug .status { opacity:.78; }
 </style>
@@ -43,7 +50,7 @@
 <body>
 <div id="stage"></div><div class="status" id="status">connecting</div>
 <script type="module">
-import { estimateVisibleMs, ttsTimeoutMs } from '/overlay-logic.js';
+import { estimateVisibleMs, ttsTimeoutMs, prepareKaraokeMarkup } from '/overlay-logic.js';
 
 const params = new URLSearchParams(location.search);
 const key = params.get('key') || '';
@@ -82,11 +89,6 @@ function remember(alert) {
 function enqueue(alert) {
   if (!remember(alert)) return;
   queue.push(alert);
-  const seq = alertSeq(alert);
-  if (seq) {
-    lastSeenSeq = Math.max(lastSeenSeq, seq);
-    localStorage.setItem(storageKey, String(lastSeenSeq));
-  }
   pump();
 }
 
@@ -101,9 +103,28 @@ function tierFor(amount) {
 
 async function pump() {
   if (playing || !queue.length) return;
+  const now = Date.now();
+  const eligibleIdx = queue.findIndex(a => now >= Number(a.playAt || a.ts || 0));
+  if (eligibleIdx === -1) {
+    const earliest = queue.reduce((min, a) => Math.min(min, Number(a.playAt || a.ts || now)), Infinity);
+    const waitMs = Math.max(100, earliest - now);
+    setTimeout(pump, waitMs);
+    return;
+  }
+
   playing = true;
-  const alert = queue.shift();
-  try { await playAlert(alert); } catch (e) { console.error(e); setStatus(`alert error: ${e?.message || e}`); }
+  const alert = queue.splice(eligibleIdx, 1)[0];
+  try {
+    await playAlert(alert);
+    const seq = alertSeq(alert);
+    if (seq && seq > lastSeenSeq) {
+      lastSeenSeq = seq;
+      localStorage.setItem(storageKey, String(lastSeenSeq));
+    }
+  } catch (e) {
+    console.error("starchik playAlert error", e);
+    setStatus(`alert error: ${e?.message || e}`);
+  }
   playing = false;
   pump();
 }
@@ -119,13 +140,32 @@ async function availableVoices() {
   });
 }
 
-async function speakComment(text, profile) {
+async function playAudioSound(url) {
+  return new Promise(resolve => {
+    const audio = new Audio(url);
+    audio.volume = .9;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 10000); // 10s safety deadlock protection
+    audio.onended = finish;
+    audio.onerror = finish;
+    audio.onpause = () => { if (audio.currentTime >= audio.duration) finish(); };
+    audio.play().catch(() => finish());
+  });
+}
+
+async function speakComment(text, profile, commentElement) {
   const clean = String(text || '').trim();
   if (!clean || !profile || !('speechSynthesis' in window) || !window.SpeechSynthesisUtterance) {
     if (profile) setStatus('TTS unavailable; text kept visible');
     return;
   }
-  await sleep(650);
+
   const voices = await availableVoices();
   const utter = new SpeechSynthesisUtterance(clean);
   utter.lang = profile.lang || 'ru-RU';
@@ -135,12 +175,37 @@ async function speakComment(text, profile) {
   const lang = utter.lang.toLowerCase().split('-')[0];
   utter.voice = (requested && voices.find(v => v.name.toLowerCase() === requested)) || voices.find(v => (v.lang || '').toLowerCase().startsWith(lang)) || null;
 
+  // Progressive Karaoke enhancement
+  if (commentElement && 'onboundary' in utter) {
+    const { html, words } = prepareKaraokeMarkup(clean);
+    if (words.length > 0) {
+      commentElement.innerHTML = html;
+      const wordSpans = commentElement.querySelectorAll('.k-word');
+      utter.onboundary = event => {
+        if (event.name !== 'word') return;
+        const charIdx = event.charIndex;
+        wordSpans.forEach(span => {
+          const start = Number(span.dataset.start);
+          const end = Number(span.dataset.end);
+          if (charIdx >= start && charIdx < end) {
+            span.classList.add('active');
+          } else if (charIdx >= end) {
+            span.classList.remove('active');
+          }
+        });
+      };
+    }
+  }
+
   return new Promise(resolve => {
     let finished = false;
     const done = () => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      if (commentElement) {
+        commentElement.querySelectorAll('.k-word').forEach(s => s.classList.remove('active'));
+      }
       resolve();
     };
     const timer = setTimeout(() => {
@@ -171,8 +236,13 @@ async function playAlert(alert) {
   const base = Number(alert.baseAmount ?? alert.amount ?? 0);
   const total = Number(alert.totalAmount ?? alert.amount ?? base);
   const tier = Number.isInteger(alert.tier) ? alert.tier : tierFor(base);
+  const displayName = alert.displayName || alert.user || 'Кто-то';
+
   const wrapper = document.createElement('div');
   wrapper.className = 'alert';
+
+  const mediaWrapper = document.createElement('div');
+  mediaWrapper.className = 'media-wrapper';
 
   const media = document.createElement('div');
   media.className = 'media';
@@ -194,11 +264,23 @@ async function playAlert(alert) {
     media.appendChild(v);
   };
   media.appendChild(img);
+  mediaWrapper.appendChild(media);
+
+  // Viewer attachment media container
+  if (alert.media?.fileId) {
+    const viewerMedia = document.createElement('div');
+    viewerMedia.className = 'viewer-media';
+    const vImg = document.createElement('img');
+    vImg.src = `/media/attachment/${alert.media.fileId}?key=${encodeURIComponent(key)}`;
+    vImg.onerror = () => viewerMedia.remove();
+    viewerMedia.appendChild(vImg);
+    mediaWrapper.appendChild(viewerMedia);
+  }
 
   const card = document.createElement('div'); card.className = 'card';
   const eyebrow = document.createElement('div'); eyebrow.className = 'eyebrow'; eyebrow.textContent = alert.test ? 'TEST • starchik' : 'STARCHIK • TELEGRAM STARS';
   const headline = document.createElement('div'); headline.className = 'headline';
-  const user = document.createElement('span'); user.textContent = alert.user || 'Кто-то';
+  const user = document.createElement('span'); user.className = 'donor-name'; user.textContent = displayName;
   const amount = document.createElement('span'); amount.className = 'amount'; amount.textContent = ` ${total} ⭐`;
   headline.append(user, document.createTextNode(' отправил'), amount);
   const ttsBadge = document.createElement('div');
@@ -206,18 +288,25 @@ async function playAlert(alert) {
   if (alert.tts) ttsBadge.textContent = `🔊 ${alert.tts.label}${Number(alert.tts.price) ? ` +${alert.tts.price} ⭐` : ''}`;
   const comment = document.createElement('div'); comment.className = 'comment'; comment.textContent = alert.comment || '';
   card.append(eyebrow, headline, ttsBadge, comment);
-  wrapper.append(media, card);
+  wrapper.append(mediaWrapper, card);
   stage.replaceChildren(wrapper);
 
-  const audio = new Audio(`/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`);
-  audio.volume = .9;
-  audio.play().catch(()=>{});
-
   requestAnimationFrame(() => wrapper.classList.add('show'));
+
+  // Strict Audio Sound completion -> Transition Pause -> TTS
+  const soundUrl = `/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`;
+  await playAudioSound(soundUrl);
+
+  await sleep(300); // Transition pause between sound and TTS
+
+  if (alert.tts && alert.comment) {
+    await speakComment(alert.comment, alert.tts, comment);
+  }
+
   const tierMinimum = Number(tierDurations[tier] || 7000);
   const visibleMs = estimateVisibleMs(alert.comment || '', tierMinimum);
-  const speech = alert.tts ? speakComment(alert.comment || '', alert.tts) : Promise.resolve();
-  await Promise.all([sleep(Math.max(1600, visibleMs - 500)), speech]);
+  await sleep(Math.max(1000, visibleMs - 1500));
+
   wrapper.classList.remove('show'); wrapper.classList.add('hide');
   await sleep(500);
   wrapper.remove();
