@@ -168,15 +168,29 @@ async function speakComment(text, profile) {
 }
 
 async function playAlert(alert) {
+  if (alert.playAt) {
+    const delay = Number(alert.playAt) - Date.now();
+    if (delay > 0) {
+      setStatus(`waiting playAt (${Math.round(delay)}ms)`);
+      await sleep(delay);
+    }
+  }
+
   const base = Number(alert.baseAmount ?? alert.amount ?? 0);
   const total = Number(alert.totalAmount ?? alert.amount ?? base);
   const tier = Number.isInteger(alert.tier) ? alert.tier : tierFor(base);
+  const displayName = alert.displayName || alert.user || 'Кто-то';
+
   const wrapper = document.createElement('div');
   wrapper.className = 'alert';
 
   const media = document.createElement('div');
   media.className = 'media';
-  const mediaUrl = `/media/animation/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`;
+
+  const mediaUrl = alert.media?.fileId
+    ? `/media/attachment/${encodeURIComponent(alert.id || alert.payload)}?key=${encodeURIComponent(key)}`
+    : `/media/animation/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`;
+
   let mediaWorked = false;
   const img = document.createElement('img');
   img.src = mediaUrl;
@@ -198,7 +212,7 @@ async function playAlert(alert) {
   const card = document.createElement('div'); card.className = 'card';
   const eyebrow = document.createElement('div'); eyebrow.className = 'eyebrow'; eyebrow.textContent = alert.test ? 'TEST • starchik' : 'STARCHIK • TELEGRAM STARS';
   const headline = document.createElement('div'); headline.className = 'headline';
-  const user = document.createElement('span'); user.textContent = alert.user || 'Кто-то';
+  const user = document.createElement('span'); user.textContent = displayName;
   const amount = document.createElement('span'); amount.className = 'amount'; amount.textContent = ` ${total} ⭐`;
   headline.append(user, document.createTextNode(' отправил'), amount);
   const ttsBadge = document.createElement('div');
@@ -209,15 +223,41 @@ async function playAlert(alert) {
   wrapper.append(media, card);
   stage.replaceChildren(wrapper);
 
-  const audio = new Audio(`/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`);
-  audio.volume = .9;
-  audio.play().catch(()=>{});
-
   requestAnimationFrame(() => wrapper.classList.add('show'));
+
+  // Play donation sound and wait for completion BEFORE TTS starts
+  const playAudioWithCompletion = () => new Promise(resolve => {
+    const audio = new Audio(`/media/sound/${tier}?key=${encodeURIComponent(key)}&v=${Date.now()}`);
+    audio.volume = .9;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(emergencyTimer);
+      resolve();
+    };
+
+    // Emergency ceiling to prevent hanging audio deadlock (30s max ceiling)
+    const emergencyTimer = setTimeout(finish, 30000);
+
+    audio.onended = finish;
+    audio.onerror = finish;
+    audio.play().then(() => {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        // Fallback safety timeout based on actual audio duration + 3s margin
+        setTimeout(finish, (audio.duration * 1000) + 3000);
+      }
+    }).catch(finish);
+  });
+
+  const soundPromise = playAudioWithCompletion();
+  await soundPromise;
+
   const tierMinimum = Number(tierDurations[tier] || 7000);
   const visibleMs = estimateVisibleMs(alert.comment || '', tierMinimum);
   const speech = alert.tts ? speakComment(alert.comment || '', alert.tts) : Promise.resolve();
   await Promise.all([sleep(Math.max(1600, visibleMs - 500)), speech]);
+
   wrapper.classList.remove('show'); wrapper.classList.add('hide');
   await sleep(500);
   wrapper.remove();

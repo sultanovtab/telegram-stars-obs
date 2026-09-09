@@ -37,25 +37,107 @@ export function enabledTtsProfiles(profiles = []) {
   return profiles.filter(p => p && p.enabled && Number(p.price) >= 0);
 }
 
-export function buildOrderPricing(baseAmount, profile = null) {
-  const base = Math.max(1, Math.trunc(Number(baseAmount) || 0));
-  if (!profile?.enabled) {
-    return { baseAmount: base, ttsFee: 0, totalAmount: base, tts: null };
+export function getOrderMediaFee(order) {
+  if (!order || order.mediaFee === undefined) return 0;
+  return Math.max(0, Math.trunc(Number(order.mediaFee) || 0));
+}
+
+export function getOrderDisplayName(order) {
+  if (!order) return 'Unknown';
+  if (order.displayName !== undefined && order.displayName !== null && String(order.displayName).trim() !== '') {
+    return String(order.displayName).trim();
   }
-  const fee = Math.max(0, Math.trunc(Number(profile.price) || 0));
+  return order.user || 'Unknown';
+}
+
+export function validateViewerMedia(mediaObj, typeHint = '') {
+  if (!mediaObj) return { ok: false, reason: 'media_missing' };
+
+  if (mediaObj.is_animated) {
+    return { ok: false, reason: 'unsupported_animated_sticker' };
+  }
+
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+  if (mediaObj.file_size && Number(mediaObj.file_size) > MAX_FILE_SIZE) {
+    return { ok: false, reason: 'file_too_large' };
+  }
+
+  return { ok: true, reason: 'ok' };
+}
+
+export function calculatePlayAt(paidAt, alertDelayMs = 10000) {
+  const t = Math.trunc(Number(paidAt) || Date.now());
+  const delay = Math.max(0, Math.trunc(Number(alertDelayMs) || 10000));
+  return t + delay;
+}
+
+export function buildOrderPricingV5({
+  baseAmount,
+  ttsProfile = null,
+  mediaAttachment = null,
+  displayName = '',
+  isAnonymous = false,
+  user = null
+}) {
+  const base = Math.max(1, Math.trunc(Number(baseAmount) || 0));
+
+  let ttsFee = 0;
+  let tts = null;
+  if (ttsProfile?.enabled) {
+    ttsFee = Math.max(0, Math.trunc(Number(ttsProfile.price) || 0));
+    tts = {
+      id: String(ttsProfile.id || 'standard'),
+      label: String(ttsProfile.label || 'Озвучка'),
+      price: ttsFee,
+      lang: String(ttsProfile.lang || 'ru-RU'),
+      rate: Number(ttsProfile.rate) || 1,
+      pitch: Number(ttsProfile.pitch) || 1,
+      voiceName: String(ttsProfile.voiceName || '')
+    };
+  }
+
+  let mediaFee = 0;
+  let media = null;
+  if (mediaAttachment) {
+    mediaFee = Math.max(0, Math.trunc(Number(mediaAttachment.price) || 0));
+    media = {
+      fileId: mediaAttachment.fileId,
+      fileUniqueId: mediaAttachment.fileUniqueId || null,
+      mime: mediaAttachment.mime || 'application/octet-stream',
+      name: mediaAttachment.name || 'media',
+      type: mediaAttachment.type || 'photo'
+    };
+  }
+
+  let finalDisplayName = 'Unknown';
+  if (isAnonymous) {
+    finalDisplayName = 'Unknown';
+  } else if (String(displayName || '').trim()) {
+    finalDisplayName = String(displayName).trim().slice(0, 40);
+  } else if (user) {
+    finalDisplayName = 'Unknown'; // Privacy invariant: new flow uses Unknown if not explicitly provided
+  }
+
+  const totalAmount = base + ttsFee + mediaFee;
+
   return {
     baseAmount: base,
-    ttsFee: fee,
-    totalAmount: base + fee,
-    tts: {
-      id: String(profile.id || 'standard'),
-      label: String(profile.label || 'Озвучка'),
-      price: fee,
-      lang: String(profile.lang || 'ru-RU'),
-      rate: Number(profile.rate) || 1,
-      pitch: Number(profile.pitch) || 1,
-      voiceName: String(profile.voiceName || '')
-    }
+    ttsFee,
+    mediaFee,
+    totalAmount,
+    tts,
+    media,
+    displayName: finalDisplayName
+  };
+}
+
+export function buildOrderPricing(baseAmount, profile = null) {
+  const pricing = buildOrderPricingV5({ baseAmount, ttsProfile: profile });
+  return {
+    baseAmount: pricing.baseAmount,
+    ttsFee: pricing.ttsFee,
+    totalAmount: pricing.totalAmount,
+    tts: pricing.tts
   };
 }
 

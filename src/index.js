@@ -7,6 +7,7 @@ import {
   normalizeConfigV4,
   enabledTtsProfiles,
   buildOrderPricing,
+  buildOrderPricingV5,
   buildStarInvoicePrices,
   findTierIndex,
   goalProgress,
@@ -14,7 +15,10 @@ import {
   validateSuccessfulPayment,
   buildPreCheckoutWebhookReply,
   nextAlertSequence,
-  validateRefundedPayment
+  validateRefundedPayment,
+  calculatePlayAt,
+  getOrderDisplayName,
+  getOrderMediaFee
 } from "./v4-logic.js";
 
 const DEFAULT_AMOUNTS = [10, 25, 50, 100, 250, 500, 1000];
@@ -506,6 +510,42 @@ export class StreamHub extends DurableObject {
 
     const parts = url.pathname.split("/").filter(Boolean);
     const kind = parts[1];
+
+    if (kind === "attachment") {
+      const payloadOrChargeId = parts[2];
+      if (!payloadOrChargeId) return new Response("Not Found", { status: 404 });
+
+      let fileId = null;
+      let mime = "application/octet-stream";
+
+      const payment = await this.ctx.storage.get(`payment:${payloadOrChargeId}`);
+      if (payment?.order?.media?.fileId) {
+        fileId = payment.order.media.fileId;
+        mime = payment.order.media.mime || mime;
+      } else {
+        const order = await this.ctx.storage.get(`order:${payloadOrChargeId}`);
+        if (order?.media?.fileId) {
+          fileId = order.media.fileId;
+          mime = order.media.mime || mime;
+        }
+      }
+
+      if (!fileId) return new Response("Not Found", { status: 404 });
+
+      try {
+        const source = await getTelegramFile(this.env, fileId);
+        const headers = new Headers();
+        headers.set("content-type", mime || source.headers.get("content-type") || "application/octet-stream");
+        headers.set("cache-control", "private, max-age=300");
+        headers.set("x-content-type-options", "nosniff");
+        const length = source.headers.get("content-length");
+        if (length) headers.set("content-length", length);
+        return new Response(source.body, { status: 200, headers });
+      } catch (error) {
+        return new Response(`Media unavailable: ${error.message}`, { status: 502 });
+      }
+    }
+
     const index = Number(parts[2]);
     if (!Number.isInteger(index) || !cfg.tiers[index] || !["animation", "sound"].includes(kind)) return new Response("Not Found", { status: 404 });
     const media = cfg.tiers[index][kind];
@@ -1138,7 +1178,7 @@ ${body}`, reply_markup });
     await this.ctx.storage.put("lastOrderCleanup", now);
   }
 
-  async createInvoice(user, baseAmount, comment, ttsProfile = null) {
+  async createInvoice(user, baseAmount, comment, ttsProfile = null, mediaAttachment = null, displayName = "", isAnonymous = false) {
     const now = Date.now();
     const invoiceRateKey = `invoiceRate:${user.id}`;
     const lastInvoiceAt = Number(await this.ctx.storage.get(invoiceRateKey) || 0);
@@ -1151,16 +1191,26 @@ ${body}`, reply_markup });
     }
     await this.cleanupStaleOrders(now);
 
-    const pricing = buildOrderPricing(baseAmount, ttsProfile);
+    const pricing = buildOrderPricingV5({
+      baseAmount,
+      ttsProfile,
+      mediaAttachment,
+      displayName,
+      isAnonymous,
+      user
+    });
     const payload = `st_${now.toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const order = {
       payload,
       userId: user.id,
       user: formatUser(user),
+      displayName: pricing.displayName,
       amount: pricing.totalAmount,
       baseAmount: pricing.baseAmount,
       totalAmount: pricing.totalAmount,
       ttsFee: pricing.ttsFee,
+      mediaFee: pricing.mediaFee,
+      media: pricing.media,
       tts: pricing.tts,
       comment: String(comment || "").slice(0, MAX_COMMENT),
       createdAt: now,
@@ -1241,22 +1291,32 @@ ${body}`, reply_markup });
         const seq = nextAlertSequence(await txn.get("alertSeq"));
         const history = (await txn.get("history")) || [];
         const paidAt = Date.now();
+        const alertDelayMs = cfg.alertDelayMs || 10000;
+        const playAt = calculatePlayAt(paidAt, alertDelayMs);
+        const displayName = getOrderDisplayName(order);
+        const mediaFee = getOrderMediaFee(order);
+
         const paidOrder = {
           ...order,
           status: "paid",
           paidAt,
+          playAt,
           telegramPaymentChargeId: chargeId
         };
         const alert = {
           id: chargeId,
           seq,
           ts: paidAt,
+          playAt,
           payload,
           user: order.user,
+          displayName,
           amount: totalAmount,
           baseAmount,
           totalAmount,
+          mediaFee,
           comment: order.comment,
+          media: order.media || null,
           tts: order.tts || null,
           tier: findTierIndex(baseAmount, cfg.tiers),
           test: false

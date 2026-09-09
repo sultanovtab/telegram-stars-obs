@@ -1548,11 +1548,19 @@ Current patterns:
 
 ### TTS hardening
 
-- animation tier uses base donation, not TTS surcharge;
+- animation tier uses base donation, not TTS or media surcharges;
 - long text remains visible longer;
 - TTS completion is awaited;
 - TTS timeout fallback;
 - errors logged and exposed in `debug=1` instead of silently disappearing.
+
+### Price snapshotting & media proxy hardening
+- order creation snapshots `baseAmount`, `ttsFee`, `mediaFee`, `totalAmount`, `media`, and `displayName` immutably;
+- future admin pricing changes do not affect already created orders;
+- donation tier is calculated strictly using `baseAmount`;
+- `playAt` timestamp is calculated at `successful_payment` time as `paidAt + alertDelayMs` (default 10s);
+- viewer media proxy route `/media/attachment/:id?key=<OBS_KEY>` enforces overlay key authentication and max 10MB limit;
+- display name privacy enforced for new donations (custom display name or 'Unknown', never raw Telegram username/ID).
 
 ---
 
