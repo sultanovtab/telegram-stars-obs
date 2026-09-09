@@ -14,7 +14,10 @@ import {
   validateSuccessfulPayment,
   buildPreCheckoutWebhookReply,
   nextAlertSequence,
-  validateRefundedPayment
+  validateRefundedPayment,
+  sanitizeDisplayName,
+  validateViewerMedia,
+  calculatePlayAt
 } from "./v4-logic.js";
 
 const DEFAULT_AMOUNTS = [10, 25, 50, 100, 250, 500, 1000];
@@ -157,6 +160,7 @@ function adminMenu() {
       [callbackButton("🎬 Анимации", "adm:animations"), callbackButton("🔊 Звуки", "adm:sounds")],
       [callbackButton("🗣 Озвучка", "adm:tts"), callbackButton("⭐ Суммы", "adm:amounts")],
       [callbackButton("🎯 Цель сбора", "adm:goal"), callbackButton("💰 Баланс", "adm:balance")],
+      [callbackButton("⏱ Задержка", "adm:delay"), callbackButton("🖼 Медиа зрителей", "adm:vmedia")],
       [callbackButton("🧪 Тест алерта", "adm:test"), callbackButton("🔗 OBS-ссылки", "adm:links")],
       [callbackButton("📋 Последние платежи", "adm:history"), callbackButton("🔐 Новый OBS-ключ", "adm:rotate")]
     ]
@@ -506,6 +510,32 @@ export class StreamHub extends DurableObject {
 
     const parts = url.pathname.split("/").filter(Boolean);
     const kind = parts[1];
+
+    if (kind === "attachment") {
+      const fileId = parts[2];
+      if (!fileId) return new Response("Not Found", { status: 404 });
+
+      // Verify that this fileId belongs to a paid order or historical payment record
+      const history = (await this.ctx.storage.get("history")) || [];
+      const belongsToPaidAlert = history.some(item => item.media?.fileId === fileId);
+      if (!belongsToPaidAlert) {
+        return new Response("Forbidden: Attachment not found in paid history", { status: 403 });
+      }
+
+      try {
+        const source = await getTelegramFile(this.env, fileId);
+        const headers = new Headers();
+        headers.set("content-type", source.headers.get("content-type") || "application/octet-stream");
+        headers.set("cache-control", "private, max-age=300");
+        headers.set("x-content-type-options", "nosniff");
+        const length = source.headers.get("content-length");
+        if (length) headers.set("content-length", length);
+        return new Response(source.body, { status: 200, headers });
+      } catch (error) {
+        return new Response(`Media unavailable: ${error.message}`, { status: 502 });
+      }
+    }
+
     const index = Number(parts[2]);
     if (!Number.isInteger(index) || !cfg.tiers[index] || !["animation", "sound"].includes(kind)) return new Response("Not Found", { status: 404 });
     const media = cfg.tiers[index][kind];
@@ -638,6 +668,34 @@ export class StreamHub extends DurableObject {
 
     const adminAction = await this.ctx.storage.get(`adminAction:${userId}`);
     if (adminAction && (await this.isAdmin(userId))) {
+      if (adminAction.type === "delay") {
+        const sec = Math.trunc(Number(text.replace(/[^0-9]/g, "")));
+        if (!Number.isFinite(sec) || sec < 0 || sec > 120) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Введи задержку от 0 до 120 секунд." });
+          return;
+        }
+        const cfg = await this.config();
+        cfg.alertDelayMs = sec * 1000;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Задержка алертов установлена: ${sec} сек.`, reply_markup: adminMenu() });
+        return;
+      }
+
+      if (adminAction.type === "vmediaprice") {
+        const val = Math.trunc(Number(text.replace(/[^0-9]/g, "")));
+        if (!Number.isFinite(val) || val < 0 || val > 5000) {
+          await tg(this.env, "sendMessage", { chat_id: userId, text: "Введи цену от 0 до 5000 ⭐." });
+          return;
+        }
+        const cfg = await this.config();
+        cfg.viewerMedia.price = val;
+        await this.saveConfig(cfg);
+        await this.ctx.storage.delete(`adminAction:${userId}`);
+        await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Цена медиа зрителя: ${val} ⭐`, reply_markup: adminMenu() });
+        return;
+      }
+
       if (adminAction.type === "amounts") {
         const values = text.split(/[ ,;]+/).map(Number).filter(Number.isFinite).map(Math.trunc);
         const unique = [...new Set(values)].filter(v => v >= 1 && v <= MAX_CUSTOM_STARS).sort((a, b) => a - b);
@@ -760,14 +818,65 @@ export class StreamHub extends DurableObject {
         await tg(this.env, "sendMessage", { chat_id: userId, text: `Введи целое число от 1 до ${MAX_CUSTOM_STARS} ⭐.` });
         return;
       }
-      await this.ctx.storage.put(`pending:${userId}`, { stage: "comment", amount });
-      await this.askComment(userId, amount);
+        await this.askDisplayName(userId, user, amount);
       return;
     }
 
+      if (pending.stage === "display_name") {
+        const displayName = sanitizeDisplayName(text);
+        await this.ctx.storage.put(`pending:${userId}`, { ...pending, stage: "comment", displayName });
+        await this.askComment(userId, pending.baseAmount);
+        return;
+      }
+
     if (pending.stage === "comment") {
       const comment = text.slice(0, MAX_COMMENT);
-      await this.offerTtsOrInvoice(user, pending.amount, comment);
+        await this.offerTtsOrMedia(user, pending.baseAmount, pending.displayName, comment);
+        return;
+      }
+
+      if (pending.stage === "media") {
+        const cfg = await this.config();
+        let mediaObj = null;
+        if (message.photo?.length) {
+          const p = message.photo[message.photo.length - 1];
+          mediaObj = {
+            type: "photo",
+            file_id: p.file_id,
+            file_unique_id: p.file_unique_id,
+            file_size: p.file_size,
+            mime_type: "image/jpeg"
+          };
+        } else if (message.sticker) {
+          mediaObj = {
+            type: "sticker",
+            file_id: message.sticker.file_id,
+            file_unique_id: message.sticker.file_unique_id,
+            file_size: message.sticker.file_size,
+            mime_type: message.sticker.is_video ? "video/webm" : (message.sticker.is_animated ? "application/x-tgsticker" : "image/webp"),
+            is_animated: message.sticker.is_animated,
+            is_video: message.sticker.is_video
+          };
+        }
+
+        const valid = validateViewerMedia(mediaObj, cfg);
+        if (!valid.ok) {
+          let reasonMsg = "Отправь фото или обычный статический стикер.";
+          if (valid.reason === "tgs_sticker_unsupported") reasonMsg = "⚠️ Анимированные TGS-стикеры не поддерживаются. Отправь фото или обычный стикер.";
+          if (valid.reason === "video_sticker_unsupported") reasonMsg = "⚠️ Видео-стикеры не поддерживаются. Отправь фото или обычный стикер.";
+          if (valid.reason === "file_too_large") reasonMsg = "⚠️ Файл слишком большой (максимум 10 МБ).";
+          await tg(this.env, "sendMessage", { chat_id: userId, text: reasonMsg });
+          return;
+        }
+
+        const attachment = {
+          fileId: mediaObj.file_id,
+          uniqueId: mediaObj.file_unique_id,
+          type: mediaObj.type,
+          mime: mediaObj.mime_type
+        };
+        await this.createInvoice(user, pending.baseAmount, pending.displayName, pending.comment, pending.ttsProfile, attachment);
+        await this.ctx.storage.delete(`pending:${userId}`);
       return;
     }
   }
@@ -821,11 +930,29 @@ export class StreamHub extends DurableObject {
       return;
     }
 
+    if (data === "name:default") {
+      const pending = await this.ctx.storage.get(`pending:${userId}`);
+      if (pending?.stage === "display_name") {
+        const displayName = sanitizeDisplayName(formatUser(user));
+        await this.ctx.storage.put(`pending:${userId}`, { ...pending, stage: "comment", displayName });
+        await this.askComment(userId, pending.baseAmount);
+      }
+      return;
+    }
+
+    if (data === "name:anonymous") {
+      const pending = await this.ctx.storage.get(`pending:${userId}`);
+      if (pending?.stage === "display_name") {
+        await this.ctx.storage.put(`pending:${userId}`, { ...pending, stage: "comment", displayName: "Unknown" });
+        await this.askComment(userId, pending.baseAmount);
+      }
+      return;
+    }
+
     if (data === "comment:skip") {
       const pending = await this.ctx.storage.get(`pending:${userId}`);
       if (pending?.stage === "comment") {
-        await this.createInvoice(user, pending.amount, "", null);
-        await this.ctx.storage.delete(`pending:${userId}`);
+        await this.offerTtsOrMedia(user, pending.baseAmount, pending.displayName, "");
       }
       return;
     }
@@ -833,20 +960,27 @@ export class StreamHub extends DurableObject {
     if (data === "tts:none" || data.startsWith("tts:")) {
       const pending = await this.ctx.storage.get(`pending:${userId}`);
       if (pending?.stage !== "tts") return;
-      if (data === "tts:none") {
-        await this.createInvoice(user, pending.baseAmount, pending.comment, null);
-      } else {
+      let ttsProfile = null;
+      if (data !== "tts:none") {
         const id = data.slice(4);
         const cfg = await this.config();
-        const profile = cfg.ttsProfiles.find(p => p.id === id && p.enabled);
-        if (!profile) {
+        ttsProfile = cfg.ttsProfiles.find(p => p.id === id && p.enabled);
+        if (!ttsProfile) {
           await tg(this.env, "sendMessage", { chat_id: userId, text: "⚠️ Эта озвучка сейчас недоступна. Выбери другой вариант." });
-          await this.offerTtsOrInvoice(user, pending.baseAmount, pending.comment);
+          await this.offerTtsOrMedia(user, pending.baseAmount, pending.displayName, pending.comment);
           return;
         }
-        await this.createInvoice(user, pending.baseAmount, pending.comment, profile);
       }
-      await this.ctx.storage.delete(`pending:${userId}`);
+      await this.offerMediaOrInvoice(user, pending.baseAmount, pending.displayName, pending.comment, ttsProfile);
+      return;
+    }
+
+    if (data === "media:skip") {
+      const pending = await this.ctx.storage.get(`pending:${userId}`);
+      if (pending?.stage === "media") {
+        await this.createInvoice(user, pending.baseAmount, pending.displayName, pending.comment, pending.ttsProfile, null);
+        await this.ctx.storage.delete(`pending:${userId}`);
+      }
       return;
     }
 
@@ -943,6 +1077,36 @@ ${lines}
         test: true
       }, false);
       await tg(this.env, "sendMessage", { chat_id: userId, text: `✅ Тест озвучки «${profile.label}» отправлен в OBS.` });
+    } else if (action === "delay") {
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "delay" });
+      const currentSec = Math.round((cfg.alertDelayMs || 10000) / 1000);
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `⏱ Текущая задержка алерта: ${currentSec} сек.
+
+Отправь новое время задержки в секундах (от 0 до 120).` });
+    } else if (action === "vmedia") {
+      const vm = cfg.viewerMedia || {};
+      await tg(this.env, "sendMessage", {
+        chat_id: userId,
+        text: `🖼 Медиа от зрителей (картинка/стикер)
+
+Статус: ${vm.enabled ? "✅ Включено" : "⛔ Выключено"}
+Цена: ${vm.price || 0} ⭐
+Разрешено: ${vm.allowPhoto ? "Фото" : ""} ${vm.allowSticker ? "Стикеры" : ""}`,
+        reply_markup: {
+          inline_keyboard: [
+            [callbackButton(vm.enabled ? "⛔ Выключить" : "✅ Включить", "adm:vmediatoggle")],
+            [callbackButton("💰 Изменить цену", "adm:vmediaprice")],
+            [callbackButton("⬅️ Админка", "adm:home")]
+          ]
+        }
+      });
+    } else if (action === "vmediatoggle") {
+      cfg.viewerMedia.enabled = !cfg.viewerMedia.enabled;
+      await this.saveConfig(cfg);
+      await tg(this.env, "sendMessage", { chat_id: userId, text: cfg.viewerMedia.enabled ? "✅ Медиа от зрителей включено." : "⛔ Медиа от зрителей выключено.", reply_markup: adminMenu() });
+    } else if (action === "vmediaprice") {
+      await this.ctx.storage.put(`adminAction:${userId}`, { type: "vmediaprice" });
+      await tg(this.env, "sendMessage", { chat_id: userId, text: `💰 Текущая цена медиа: ${cfg.viewerMedia?.price || 0} ⭐\nОтправь новую цену в Stars.` });
     } else if (action === "amounts") {
       await this.ctx.storage.put(`adminAction:${userId}`, { type: "amounts" });
       await tg(this.env, "sendMessage", { chat_id: userId, text: `⭐ Сейчас: ${cfg.amounts.join(" / ")}
@@ -1083,6 +1247,7 @@ ${body}`, reply_markup });
   }
 
   async beginDonation(userId, intended) {
+    const user = await this.ctx.storage.get(`pending:${userId}`)?.then(p => p?.user).catch(() => null);
     if (intended === "custom") {
       await this.ctx.storage.put(`pending:${userId}`, { stage: "custom" });
       await tg(this.env, "sendMessage", { chat_id: userId, text: `✏️ Напиши количество Stars числом (1–${MAX_CUSTOM_STARS}).`, reply_markup: { inline_keyboard: [[callbackButton("❌ Отмена", "cancel")]] } });
@@ -1090,28 +1255,42 @@ ${body}`, reply_markup });
     }
     const amount = Number(intended);
     if (!Number.isInteger(amount) || amount < 1 || amount > MAX_CUSTOM_STARS) return;
-    await this.ctx.storage.put(`pending:${userId}`, { stage: "comment", amount });
-    await this.askComment(userId, amount);
+    await this.askDisplayName(userId, user, amount);
   }
 
-  async askComment(userId, amount) {
+  async askDisplayName(userId, user, baseAmount) {
+    await this.ctx.storage.put(`pending:${userId}`, { stage: "display_name", baseAmount, user });
+    const defaultName = formatUser(user || { id: userId });
     await tg(this.env, "sendMessage", {
       chat_id: userId,
-      text: `💬 ${amount} ⭐\nНапиши комментарий для стрима (до ${MAX_COMMENT} символов) или нажми «Без комментария».`,
+      text: `✏️ Укажи публичное имя для стрима (до 30 символов) или выбери вариант ниже.`,
+      reply_markup: {
+        inline_keyboard: [
+          [callbackButton(`Использовать ${defaultName}`, "name:default")],
+          [callbackButton("🔒 Анонимно", "name:anonymous")],
+          [callbackButton("❌ Отмена", "cancel")]
+        ]
+      }
+    });
+  }
+
+  async askComment(userId, baseAmount) {
+    await tg(this.env, "sendMessage", {
+      chat_id: userId,
+      text: `💬 ${baseAmount} ⭐\nНапиши комментарий для стрима (до ${MAX_COMMENT} символов) или нажми «Без комментария».`,
       reply_markup: { inline_keyboard: [[callbackButton("Без комментария", "comment:skip")], [callbackButton("❌ Отмена", "cancel")]] }
     });
   }
 
-  async offerTtsOrInvoice(user, baseAmount, comment) {
+  async offerTtsOrMedia(user, baseAmount, displayName, comment) {
     const cfg = await this.config();
     const profiles = enabledTtsProfiles(cfg.ttsProfiles);
     const cleanComment = String(comment || "").slice(0, MAX_COMMENT);
     if (!cleanComment || !profiles.length) {
-      await this.createInvoice(user, baseAmount, cleanComment, null);
-      await this.ctx.storage.delete(`pending:${user.id}`);
+      await this.offerMediaOrInvoice(user, baseAmount, displayName, cleanComment, null);
       return;
     }
-    await this.ctx.storage.put(`pending:${user.id}`, { stage: "tts", baseAmount, comment: cleanComment });
+    await this.ctx.storage.put(`pending:${user.id}`, { stage: "tts", baseAmount, displayName, comment: cleanComment });
     const rows = profiles.map(p => [callbackButton(`🔊 ${p.label} +${p.price} ⭐`, `tts:${p.id}`)]);
     rows.push([callbackButton("Без озвучки", "tts:none")], [callbackButton("❌ Отмена", "cancel")]);
     await tg(this.env, "sendMessage", {
@@ -1120,6 +1299,27 @@ ${body}`, reply_markup });
 Основная поддержка: ${baseAmount} ⭐
 Озвучка добавляется к сумме до оплаты.`,
       reply_markup: { inline_keyboard: rows }
+    });
+  }
+
+  async offerMediaOrInvoice(user, baseAmount, displayName, comment, ttsProfile) {
+    const cfg = await this.config();
+    if (!cfg.viewerMedia?.enabled) {
+      await this.createInvoice(user, baseAmount, displayName, comment, ttsProfile, null);
+      await this.ctx.storage.delete(`pending:${user.id}`);
+      return;
+    }
+    await this.ctx.storage.put(`pending:${user.id}`, { stage: "media", baseAmount, displayName, comment, ttsProfile });
+    await tg(this.env, "sendMessage", {
+      chat_id: user.id,
+      text: `🖼 Хочешь прикрепить картинку или стикер к донату? (+${cfg.viewerMedia.price} ⭐)
+Отправь фото или обычный стикер сообщением.`,
+      reply_markup: {
+        inline_keyboard: [
+          [callbackButton("Без картинки / стикера", "media:skip")],
+          [callbackButton("❌ Отмена", "cancel")]
+        ]
+      }
     });
   }
 
@@ -1138,7 +1338,7 @@ ${body}`, reply_markup });
     await this.ctx.storage.put("lastOrderCleanup", now);
   }
 
-  async createInvoice(user, baseAmount, comment, ttsProfile = null) {
+  async createInvoice(user, baseAmount, displayName, comment, ttsProfile = null, mediaAttachment = null) {
     const now = Date.now();
     const invoiceRateKey = `invoiceRate:${user.id}`;
     const lastInvoiceAt = Number(await this.ctx.storage.get(invoiceRateKey) || 0);
@@ -1151,17 +1351,22 @@ ${body}`, reply_markup });
     }
     await this.cleanupStaleOrders(now);
 
-    const pricing = buildOrderPricing(baseAmount, ttsProfile);
+    const cfg = await this.config();
+    const mediaFee = mediaAttachment ? Math.max(0, Number(cfg.viewerMedia?.price) || 0) : 0;
+    const pricing = buildOrderPricing(baseAmount, ttsProfile, mediaFee);
     const payload = `st_${now.toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const order = {
       payload,
       userId: user.id,
       user: formatUser(user),
+      displayName: sanitizeDisplayName(displayName || formatUser(user)),
       amount: pricing.totalAmount,
       baseAmount: pricing.baseAmount,
-      totalAmount: pricing.totalAmount,
       ttsFee: pricing.ttsFee,
+      mediaFee: pricing.mediaFee,
+      totalAmount: pricing.totalAmount,
       tts: pricing.tts,
+      media: mediaAttachment ? { fileId: mediaAttachment.fileId, type: mediaAttachment.type, mime: mediaAttachment.mime } : null,
       comment: String(comment || "").slice(0, MAX_COMMENT),
       createdAt: now,
       status: "invoice_sent"
@@ -1169,10 +1374,13 @@ ${body}`, reply_markup });
     await this.ctx.storage.put(`order:${payload}`, order);
 
     const prices = buildStarInvoicePrices(pricing);
+    const descParts = ["Показ Stars-алерта на стриме"];
+    if (pricing.tts) descParts.push(`озвучка «${pricing.tts.label}»`);
+    if (pricing.mediaFee) descParts.push("медиа-вложение");
     await tg(this.env, "sendInvoice", {
       chat_id: user.id,
       title: `Поддержка ${this.env.BRAND_NAME}`.slice(0, 32),
-      description: pricing.tts ? `Алерт + озвучка «${pricing.tts.label}»` : "Показ Stars-алерта и сообщения на стриме",
+      description: descParts.join(" + ").slice(0, 255),
       payload,
       currency: "XTR",
       prices
@@ -1193,15 +1401,16 @@ ${body}`, reply_markup });
 
     const claimedRecord = claim.record;
     const order = claimedRecord.order || {};
-    const detail = order.tts ? `
-🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
+    const detail = order.tts ? `\n🔊 ${order.tts.label}: +${order.tts.price} ⭐` : "";
+    const delaySec = Math.round((cfg.alertDelayMs ?? 10000) / 1000);
+    const timingMsg = delaySec > 0
+      ? `\nАлерт появится на стриме примерно через ${delaySec} секунд.\nЕсли сейчас проигрывается другой донат, он появится в очереди.`
+      : `\nАлерт отправлен на стрим.`;
     try {
       await tg(this.env, "sendMessage", {
         chat_id: message.chat.id,
         text: `💛 Спасибо! ${claimedRecord.totalAmount} ⭐ получены.${detail}
-Алерт отправлен на стрим.${order.comment ? `
-
-Твой комментарий: “${order.comment}”` : ""}`,
+${timingMsg}${order.comment ? `\n\nТвой комментарий: “${order.comment}”` : ""}`,
         reply_markup: mainMenu(cfg.amounts)
       });
       return completePaymentReceipt(this.ctx.storage, claimedRecord);
@@ -1241,6 +1450,7 @@ ${body}`, reply_markup });
         const seq = nextAlertSequence(await txn.get("alertSeq"));
         const history = (await txn.get("history")) || [];
         const paidAt = Date.now();
+        const playAt = calculatePlayAt(paidAt, cfg.alertDelayMs);
         const paidOrder = {
           ...order,
           status: "paid",
@@ -1251,13 +1461,18 @@ ${body}`, reply_markup });
           id: chargeId,
           seq,
           ts: paidAt,
+          playAt,
           payload,
           user: order.user,
+          displayName: order.displayName || order.user?.first_name || order.user || "Unknown",
           amount: totalAmount,
           baseAmount,
+          mediaFee: order.mediaFee || 0,
+          ttsFee: order.ttsFee || 0,
           totalAmount,
           comment: order.comment,
           tts: order.tts || null,
+          media: order.media || null,
           tier: findTierIndex(baseAmount, cfg.tiers),
           test: false
         };
@@ -1274,6 +1489,7 @@ ${body}`, reply_markup });
           delivery: "pending",
           receiptSent: false,
           createdAt: paidAt,
+          playAt,
           order: paidOrder,
           alert
         };
